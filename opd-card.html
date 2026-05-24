@@ -323,6 +323,7 @@ textarea.fctl{resize:vertical;min-height:80px;}
     <button id="syncBtn" class="btn btn-outline btn-sm" onclick="syncToSheets()" style="background:rgba(255,255,255,.15);border-color:rgba(255,255,255,.3);color:#fff;" title="Sync ไป Google Sheets">🔄 Sync</button>
     <button id="pullBtn" class="btn btn-outline btn-sm" onclick="syncFromSheets()" style="background:rgba(255,255,255,.15);border-color:rgba(255,255,255,.3);color:#fff;" title="ดึงข้อมูลจาก Google Sheets">⬇️ Pull</button>
     <button id="autoSyncToggle" class="btn btn-outline btn-sm" onclick="toggleAutoSync()" style="background:rgba(255,255,255,.15);border-color:rgba(255,255,255,.3);color:#fff;" title="เปิด/ปิด Auto Sync">⚡ Auto</button>
+    <button id="autoLoginToggle" class="btn btn-outline btn-sm" onclick="toggleAutoLogin()" style="background:rgba(255,255,255,.15);border-color:rgba(255,255,255,.3);color:#fff;" title="เปิด/ปิด Auto Login Google">🔑 Login</button>
     <button class="btn btn-success btn-sm" onclick="openAddPatient()">+ เพิ่มผู้ป่วย</button>
   </div>
 </nav>
@@ -1074,7 +1075,7 @@ textarea.fctl{resize:vertical;min-height:80px;}
 </script>
 <script>
 // ─── DB ───────────────────────────────────────────────────────────
-const DB_NAME = 'OPDCardDB', DB_VER = 3;
+const DB_NAME = 'OPDCardDB', DB_VER = 4;
 let db;
 
 function initDB() {
@@ -1127,6 +1128,7 @@ function initDB() {
           cur.onerror = err => console.warn('migration cursor error', err);
         } catch(err) { console.error('Migration v3 failed:', err); }
       }
+      // ── v4: driveFileId + cachedAt fields (no structural change needed, just version bump) ──
     };
     req.onsuccess = e => { db = e.target.result; res(db); };
     req.onerror = rej;
@@ -1179,6 +1181,86 @@ function dbGetByIndex(store, idx, val) {
 
 function uid() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2);
+}
+
+// ─── HYBRID PHOTO SYSTEM ─────────────────────────────────────────────
+// placeholder สีเทาตอนไม่มีเน็ต
+const PHOTO_PLACEHOLDER = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTYwIiBoZWlnaHQ9IjIxMCIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cmVjdCB3aWR0aD0iMTYwIiBoZWlnaHQ9IjIxMCIgZmlsbD0iI2VjZjBmMSIvPjx0ZXh0IHg9IjgwIiB5PSIxMDUiIGZvbnQtc2l6ZT0iMTIiIGZpbGw9IiM5NWE1YTYiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGRvbWluYW50LWJhc2VsaW5lPSJtaWRkbGUiPuC4oeC4suC4geC4reC4mOC5gOC4lOC5iDwvdGV4dD48L3N2Zz4=';
+
+// placeholder spinner (loading) — แสดงตอนกำลังดึงรูปจาก Drive
+// ใช้ encodeURIComponent แทน btoa เพื่อรองรับ Unicode
+const PHOTO_LOADING = 'data:image/svg+xml,' + encodeURIComponent(`<svg width="160" height="210" xmlns="http://www.w3.org/2000/svg">
+  <rect width="160" height="210" fill="#f0f3f4"/>
+  <circle cx="80" cy="95" r="18" fill="none" stroke="#aab7b8" stroke-width="3" stroke-dasharray="28 56" stroke-linecap="round">
+    <animateTransform attributeName="transform" type="rotate" from="0 80 95" to="360 80 95" dur="0.9s" repeatCount="indefinite"/>
+  </circle>
+  <text x="80" y="130" font-size="11" fill="#aab7b8" text-anchor="middle">Loading...</text>
+</svg>`);
+
+// track token expiry toast ไม่ให้แสดงซ้ำบ่อย
+let _tokenExpiredToastShown = false;
+
+// ดึง src ของรูป: local → Drive → placeholder
+async function getPhotoSrc(photo) {
+  if (!photo) return PHOTO_PLACEHOLDER;
+  // มี dataUrl อยู่แล้ว (รูปใหม่หรือ cache)
+  if (photo.dataUrl) return photo.dataUrl;
+  // มี driveFileId → ลองดึงจาก Drive
+  if (photo.driveFileId) {
+    if (!sheetsAccessToken) {
+      // แจ้งเตือนให้ login ถ้ายังไม่มี token
+      if (!_tokenExpiredToastShown) {
+        _tokenExpiredToastShown = true;
+        showToast('🔑 กรุณากด Sync เพื่อ login Google ก่อนดูรูป', 'info');
+        setTimeout(() => { _tokenExpiredToastShown = false; }, 10000);
+      }
+      return PHOTO_PLACEHOLDER;
+    }
+    try {
+      const resp = await fetch(
+        `https://www.googleapis.com/drive/v3/files/${photo.driveFileId}?alt=media`,
+        { headers: { Authorization: `Bearer ${sheetsAccessToken}` } }
+      );
+      if (resp.ok) {
+        const blob = await resp.blob();
+        const dataUrl = await new Promise(resolve => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.readAsDataURL(blob);
+        });
+        // cache กลับลง IndexedDB พร้อม timestamp ใหม่
+        await dbPut('photos', { ...photo, dataUrl, cachedAt: new Date().toISOString() });
+        return dataUrl;
+      } else if (resp.status === 401) {
+        // token หมดอายุ
+        sheetsAccessToken = null;
+        if (!_tokenExpiredToastShown) {
+          _tokenExpiredToastShown = true;
+          showToast('⚠️ Token หมดอายุ กรุณากด Sync ใหม่', 'error');
+          setTimeout(() => { _tokenExpiredToastShown = false; }, 10000);
+        }
+      }
+    } catch(e) { console.warn('getPhotoSrc fetch failed', e); }
+  }
+  // ไม่มีเน็ต หรือ fetch ไม่สำเร็จ
+  return PHOTO_PLACEHOLDER;
+}
+
+// ลบ cache ที่เกิน 4 เดือน (รันตอนเปิดโปรแกรม)
+async function cleanExpiredCache() {
+  try {
+    const FOUR_MONTHS_MS = 4 * 30 * 24 * 60 * 60 * 1000;
+    const cutoff = Date.now() - FOUR_MONTHS_MS;
+    const photos = await dbGetAll('photos');
+    let cleaned = 0;
+    for (const ph of photos) {
+      if (ph.driveFileId && ph.cachedAt && new Date(ph.cachedAt).getTime() < cutoff) {
+        await dbPut('photos', { ...ph, dataUrl: null, cachedAt: null });
+        cleaned++;
+      }
+    }
+    if (cleaned > 0) console.log(`cleanExpiredCache: cleared ${cleaned} photos`);
+  } catch(e) { console.warn('cleanExpiredCache error', e); }
 }
 
 // ─── STATE ──────────────────────────────────────────────────────────
@@ -2301,9 +2383,12 @@ async function renderPatientPage(patientId) {
 }
 
 async function buildTimeline(visits) {
+  // visits ถูก sort newest→oldest แล้ว: index 0 = ล่าสุด, index last = แรกสุด (Op)
+  const eagerIndices = new Set([0, visits.length - 1]); // โหลดทันที: ล่าสุด + แรกสุด
+
   const items = await Promise.all(visits.map(async (v, i) => {
     const isLast = i === visits.length - 1;
-    const photos = await dbGetByIndex('photos','visitId', v.id);
+    const isEager = eagerIndices.has(i);
     const isOp   = _OP_TYPES.includes(v.type);
     const isFU   = _FU_TYPES.includes(v.type);
     const isSkin = _SKIN_TYPES.includes(v.type);
@@ -2319,12 +2404,20 @@ async function buildTimeline(visits) {
       : (v.note || '').slice(0,80);
 
     let thumbsHTML = '';
-    if (photos.length) {
-      const shown = photos.slice(0,5);
-      thumbsHTML = '<div class="tl-photos">' +
-        shown.map(ph => `<img class="thumb" src="${ph.dataUrl}" onclick="openLightbox('${ph.dataUrl}',event)">`).join('') +
-        (photos.length > 5 ? `<div style="display:flex;align-items:center;font-size:12px;color:var(--text-light);padding:0 6px;">+${photos.length-5}</div>` : '') +
-      '</div>';
+    if (isEager) {
+      // โหลดรูปทันที (visit แรก + ล่าสุด)
+      const photos = await dbGetByIndex('photos','visitId', v.id);
+      if (photos.length) {
+        const shown = photos.slice(0,5);
+        const srcs = await Promise.all(shown.map(ph => getPhotoSrc(ph)));
+        thumbsHTML = '<div class="tl-photos">' +
+          shown.map((ph, idx) => `<img class="thumb" src="${srcs[idx]}" onclick="tlPhotoClick('${ph.id}',event)">`).join('') +
+          (photos.length > 5 ? `<div style="display:flex;align-items:center;font-size:12px;color:var(--text-light);padding:0 6px;">+${photos.length-5}</div>` : '') +
+        '</div>';
+      }
+    } else {
+      // lazy: placeholder ก่อน โหลดตอน scroll ถึง
+      thumbsHTML = `<div class="tl-photos tl-photos-lazy" data-visit-id="${v.id}" style="min-height:80px;display:flex;align-items:center;justify-content:center;"><div style="font-size:12px;color:#aab7b8;">⏳ รอโหลด...</div></div>`;
     }
 
     return `
@@ -2422,7 +2515,59 @@ async function buildTimeline(visits) {
         </div>
       </div>`;
   }));
-  return items.join('');
+  const html = items.join('');
+  // เริ่ม IntersectionObserver หลัง render เสร็จ
+  setTimeout(() => _initTimelineLazyLoad(), 100);
+  return html;
+}
+
+// Lazy load รูปใน timeline โดยใช้ scroll event (รองรับ overflow:hidden container)
+async function _loadLazyDiv(el) {
+  if (el.dataset.loaded) return;
+  el.dataset.loaded = '1';
+  const visitId = el.dataset.visitId;
+  const photos = await dbGetByIndex('photos', 'visitId', visitId);
+  if (!photos.length) { el.style.minHeight = ''; return; }
+  const shown = photos.slice(0, 5);
+  const srcs = await Promise.all(shown.map(ph => getPhotoSrc(ph)));
+  el.style.display = '';
+  el.style.justifyContent = '';
+  el.style.alignItems = '';
+  el.innerHTML =
+    shown.map((ph, idx) => `<img class="thumb" src="${srcs[idx]}" onclick="tlPhotoClick('${ph.id}',event)">`).join('') +
+    (photos.length > 5 ? `<div style="display:flex;align-items:center;font-size:12px;color:var(--text-light);padding:0 6px;">+${photos.length - 5}</div>` : '');
+  el.style.minHeight = '';
+}
+
+function _checkLazyDivsInView() {
+  const lazyDivs = document.querySelectorAll('.tl-photos-lazy:not([data-loaded])');
+  if (!lazyDivs.length) {
+    window.removeEventListener('scroll', _checkLazyDivsInView, true);
+    return;
+  }
+  const vpBottom = window.innerHeight + 200;
+  lazyDivs.forEach(el => {
+    const rect = el.getBoundingClientRect();
+    if (rect.top < vpBottom) _loadLazyDiv(el);
+  });
+}
+
+function _initTimelineLazyLoad() {
+  const lazyDivs = document.querySelectorAll('.tl-photos-lazy');
+  if (!lazyDivs.length) return;
+  // check ทันทีสำหรับ div ที่อยู่ใน viewport แล้ว
+  _checkLazyDivsInView();
+  // ฟัง scroll event บน window และ capture phase เพื่อจับ scroll ใน nested container ด้วย
+  window.addEventListener('scroll', _checkLazyDivsInView, true);
+}
+
+// คลิกรูปใน timeline → เปิด lightbox
+async function tlPhotoClick(photoId, e) {
+  if (e) e.stopPropagation();
+  const photo = await dbGet('photos', photoId);
+  if (!photo) return;
+  const src = await getPhotoSrc(photo);
+  openLightbox(src, null, `photo_${photoId}.jpg`);
 }
 
 // ─── VISIT DETAIL PAGE ───────────────────────────────────────────────
@@ -2449,21 +2594,27 @@ async function renderVisitPage(visitId) {
   const badgeClass = vIsOp ? 'vb-op' : vIsSkin ? 'vb-skin' : 'vb-followup';
 
   photos.sort((a,b) => (a.sortOrder ?? Date.parse(a.createdAt||'0')) - (b.sortOrder ?? Date.parse(b.createdAt||'0')));
+  // โหลด src ทุกรูปผ่าน getPhotoSrc (local / Drive / placeholder)
+  const photoSrcMap = {};
+  await Promise.all(photos.map(async ph => { photoSrcMap[ph.id] = await getPhotoSrc(ph); }));
+
   const befores = photos.filter(ph => ph.photoType === 'before');
   const afters  = photos.filter(ph => ph.photoType === 'after');
   const others  = photos.filter(ph => ph.photoType !== 'before' && ph.photoType !== 'after');
 
-  const mkPhotoCard = (ph, label, section, idx, total) =>
-    `<div class="photo-card" data-photo-id="${ph.id}">
-      <img src="${ph.dataUrl}" onclick="photoClick('${ph.id}','${ph.dataUrl}','${label}',event)" style="cursor:pointer;" draggable="false">
+  const mkPhotoCard = (ph, label, section, idx, total) => {
+    const src = photoSrcMap[ph.id] || PHOTO_PLACEHOLDER;
+    return `<div class="photo-card" data-photo-id="${ph.id}">
+      <img src="${src}" onclick="photoClick('${ph.id}','${src}','${label}',event)" style="cursor:pointer;" draggable="false">
       <button class="ph-del" onclick="deletePhoto('${ph.id}','${v.id}',event)" title="ลบรูป">×</button>
-      <a class="ph-dl" href="${ph.dataUrl}" download="${(p?p.name.replace(/\s+/g,'_'):'photo')}_${v.date}_${label}.jpg" onclick="event.stopPropagation()" title="ดาวน์โหลดรูปนี้">⬇</a>
+      <a class="ph-dl" href="${src}" download="${(p?p.name.replace(/\s+/g,'_'):'photo')}_${v.date}_${label}.jpg" onclick="event.stopPropagation()" title="ดาวน์โหลดรูปนี้">⬇</a>
       <div class="ph-order-btns">
         ${idx > 0         ? `<button onclick="movePhoto('${ph.id}','${section}','${v.id}',-1,event)" title="เลื่อนซ้าย">◀</button>` : '<span></span>'}
         ${idx < total - 1 ? `<button onclick="movePhoto('${ph.id}','${section}','${v.id}',+1,event)" title="เลื่อนขวา">▶</button>` : '<span></span>'}
       </div>
       <div class="ph-lbl">${label}</div>
     </div>`;
+  };
 
   const cmpBtn = `<button onclick="toggleCompareMode()" id="btnCompareMode" style="font-size:12px;padding:3px 10px;border-radius:6px;border:1px solid var(--border);background:#fff;cursor:pointer;color:var(--text-light);font-weight:500;">⟺ เปรียบเทียบ</button>`;
 
@@ -3560,6 +3711,22 @@ async function openCrossVisitCompare(patientId) {
 
     _xvSelected = [];
 
+    // โหลดรูปที่ยังไม่มี dataUrl จาก Drive พร้อม loading indicator
+    const missingPhotos = photos.filter(ph => !ph.dataUrl && ph.driveFileId);
+    if (missingPhotos.length > 0) {
+      showProgress(`📸 กำลังโหลดรูปสำหรับเปรียบเทียบ 0/${missingPhotos.length}...`);
+      let loaded = 0;
+      await Promise.all(missingPhotos.map(async ph => {
+        await getPhotoSrc(ph); // cache กลับลง IndexedDB อัตโนมัติ
+        loaded++;
+        showProgress(`📸 กำลังโหลดรูปสำหรับเปรียบเทียบ ${loaded}/${missingPhotos.length}...`);
+      }));
+      hideProgress();
+      // โหลด photos ใหม่หลัง cache แล้ว
+      const refreshed = await dbGetByIndex('photos', 'patientId', patientId);
+      photos.splice(0, photos.length, ...refreshed);
+    }
+
     // group photos by visitId
     const visitMap = {};
     visits.forEach(v => { visitMap[v.id] = v; });
@@ -3606,9 +3773,10 @@ async function openCrossVisitCompare(patientId) {
                        : (ph.photoType || 'Photo');
         const fullLabel = `${visitLabel} · ${typeLbl}`;
         const fullLabelEsc = esc(fullLabel).replace(/"/g,'&quot;');
-        const srcEsc = String(ph.dataUrl||'').replace(/"/g,'&quot;');
+        const src = ph.dataUrl || PHOTO_PLACEHOLDER;
+        const srcEsc = src.replace(/"/g,'&quot;');
         return `<div class="xv-card" data-xv-id="${esc(ph.id)}" onclick="_xvSelectPhoto('${esc(ph.id)}','${srcEsc}','${fullLabelEsc}',event)" style="position:relative;border:2px solid var(--border);border-radius:8px;overflow:hidden;cursor:pointer;background:#fff;transition:border-color .15s;">
-          <img src="${ph.dataUrl}" style="width:100%;aspect-ratio:3/4;object-fit:cover;display:block;pointer-events:none;">
+          <img src="${srcEsc}" style="width:100%;aspect-ratio:3/4;object-fit:cover;display:block;pointer-events:none;">
           <div style="padding:5px 8px;font-size:11px;color:var(--text-light);background:#fff;border-top:1px solid var(--border);">${esc(typeLbl)}</div>
         </div>`;
       }).join('');
@@ -4805,7 +4973,10 @@ async function migrateDOBYears() {
 async function initApp() {
   await initDB();
   await migrateDOBYears();
+  cleanExpiredCache(); // ลบ cache เกิน 4 เดือน (ไม่ต้อง await เพื่อไม่ให้ delay การเปิดหน้า)
   showHome();
+  // Auto login ถ้าเปิดใช้งาน (หลัง Google API โหลดเสร็จ)
+  setTimeout(autoLoginIfEnabled, 1500);
 }
 
 initApp();
@@ -5772,6 +5943,12 @@ async function exportPatientPDF(patientId) {
   if (!p) return;
   const visits = (await dbGetByIndex('visits','patientId', patientId)).sort((a,b)=>b.date.localeCompare(a.date));
 
+  // นับรูปทั้งหมดก่อนเพื่อแสดง progress
+  const allPhotos = await dbGetByIndex('photos', 'patientId', patientId);
+  const needFetch = allPhotos.filter(ph => !ph.dataUrl && ph.driveFileId).length;
+  let fetchedCount = 0;
+  if (needFetch > 0) showToast(`⏳ กำลังโหลดรูป 0/${needFetch}...`, 'info');
+
   // Build photo rows per visit
   async function getVisitPhotos(vid) {
     const photos = await dbGetByIndex('photos','visitId', vid);
@@ -5846,23 +6023,34 @@ async function exportPatientPDF(patientId) {
         ${complications.map(c=>`<div style="font-size:12px;margin-bottom:3px;">• ${c}</div>`).join('')}
       </div>` : '';
 
-    const photoToImg = (ph) => `<img src="${ph.dataUrl}" style="width:120px;height:160px;object-fit:cover;border-radius:4px;border:1px solid #d5d8dc;" onerror="this.style.display='none'">`;
+    const photoToImg = async (ph) => {
+      const src = await getPhotoSrc(ph);
+      if (!ph.dataUrl && ph.driveFileId && needFetch > 0 && src !== PHOTO_PLACEHOLDER) {
+        fetchedCount++;
+        showToast(`⏳ กำลังโหลดรูป ${fetchedCount}/${needFetch}...`, 'info');
+      }
+      return `<img src="${src}" style="width:120px;height:160px;object-fit:cover;border-radius:4px;border:1px solid #d5d8dc;" onerror="this.style.display='none'">`;
+    };
+
+    const beforeImgs = await Promise.all(beforePhotos.map(photoToImg));
+    const afterImgs  = await Promise.all(afterPhotos.map(photoToImg));
+    const otherImgs  = await Promise.all(otherPhotos.map(photoToImg));
 
     const baHTML = (beforePhotos.length || afterPhotos.length) ? `
       <div style="margin-top:10px;display:grid;grid-template-columns:1fr 1fr;gap:12px;">
         <div>
           <div style="text-align:center;font-size:11px;font-weight:700;background:#fadbd8;color:#c0392b;padding:4px;border-radius:4px;margin-bottom:6px;">BEFORE</div>
-          <div style="display:flex;flex-wrap:wrap;gap:6px;">${beforePhotos.map(photoToImg).join('')}</div>
+          <div style="display:flex;flex-wrap:wrap;gap:6px;">${beforeImgs.join('')}</div>
         </div>
         <div>
           <div style="text-align:center;font-size:11px;font-weight:700;background:#d5f5e3;color:#1e8449;padding:4px;border-radius:4px;margin-bottom:6px;">AFTER</div>
-          <div style="display:flex;flex-wrap:wrap;gap:6px;">${afterPhotos.map(photoToImg).join('')}</div>
+          <div style="display:flex;flex-wrap:wrap;gap:6px;">${afterImgs.join('')}</div>
         </div>
       </div>` : '';
 
     const otherHTML = otherPhotos.length ? `
       <div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:6px;">
-        ${otherPhotos.map(photoToImg).join('')}
+        ${otherImgs.join('')}
       </div>` : '';
 
     return `
@@ -5976,6 +6164,7 @@ async function exportPatientPDF(patientId) {
 </body>
 </html>`;
 
+  if (needFetch > 0) showToast(`✅ โหลดรูปครบ ${needFetch} รูป กำลังเปิด PDF...`, 'ok');
   const win = window.open('', '_blank');
   win.document.write(html);
   win.document.close();
@@ -6160,9 +6349,43 @@ async function autoSync() {
   await performSheetsSync();
 }
 
+// ─── AUTO LOGIN ──────────────────────────────────────────────────────
+let autoLoginEnabled = localStorage.getItem('autoLoginEnabled') === 'true';
+
+function toggleAutoLogin() {
+  autoLoginEnabled = !autoLoginEnabled;
+  localStorage.setItem('autoLoginEnabled', autoLoginEnabled);
+  updateAutoLoginBtn();
+  showToast(autoLoginEnabled ? '🔑 Auto Login เปิดแล้ว' : '🔑 Auto Login ปิดแล้ว', 'ok');
+}
+
+function updateAutoLoginBtn() {
+  const btn = document.getElementById('autoLoginToggle');
+  if (!btn) return;
+  if (autoLoginEnabled) {
+    btn.style.background = 'rgba(39,174,96,.6)';
+    btn.style.borderColor = 'rgba(39,174,96,.8)';
+    btn.textContent = '🔑 Login: ON';
+  } else {
+    btn.style.background = 'rgba(255,255,255,.15)';
+    btn.style.borderColor = 'rgba(255,255,255,.3)';
+    btn.textContent = '🔑 Login';
+  }
+}
+
+function autoLoginIfEnabled() {
+  if (!autoLoginEnabled) return;
+  if (sheetsAccessToken) return; // มี token อยู่แล้ว
+  if (!window.google || !window.google.accounts) return;
+  if (!sheetsTokenClient) initSheetsClient();
+  sheetsTokenCallback = _backgroundCachePhotos; // cache รูปอัตโนมัติหลัง login
+  sheetsTokenClient.requestAccessToken({ prompt: '' });
+}
+
 // อัพเดต button state หลัง page load
 window.addEventListener('load', () => {
   setTimeout(updateAutoSyncBtn, 600);
+  setTimeout(updateAutoLoginBtn, 600);
 });
 
 function initSheetsClient() {
@@ -6255,18 +6478,60 @@ async function syncPhotos() {
       const form = new FormData();
       form.append('metadata', new Blob([metadata], { type: 'application/json' }));
       form.append('file', blob);
-      await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+      const uploadResp = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
         method: 'POST',
         headers: { Authorization: `Bearer ${sheetsAccessToken}` },
         body: form
       });
+      // หลัง upload สำเร็จ → บันทึก driveFileId และลบ dataUrl ออกจาก local (hybrid)
+      if (uploadResp.ok) {
+        const uploadData = await uploadResp.json();
+        await dbPut('photos', {
+          ...photo,
+          driveFileId: uploadData.id,
+          driveFileName: fileName,
+          cachedAt: new Date().toISOString(),
+          dataUrl: null  // ลบรูปจริงออก เหลือแค่ที่อยู่บน Drive
+        });
+      }
     }
     hideProgress();
     showToast(`📸 Sync รูปสำเร็จ: ${uploaded} รูปใหม่`, 'ok');
+    // Background cache: fetch รูปที่ยังไม่มี dataUrl กลับมาเก็บไว้ offline
+    _backgroundCachePhotos();
   } catch (e) {
     hideProgress();
     showToast('❌ Sync รูปล้มเหลว: ' + e.message);
   }
+}
+
+// Background cache รูปทั้งหมดจาก Drive → IndexedDB (ไม่ block UI)
+async function _backgroundCachePhotos() {
+  try {
+    const photos = await dbGetAll('photos');
+    const needCache = photos.filter(ph => ph.driveFileId && !ph.dataUrl);
+    if (!needCache.length) return;
+    console.log(`background cache: ${needCache.length} รูป`);
+    for (const ph of needCache) {
+      if (!sheetsAccessToken) break; // หยุดถ้า token หมด
+      try {
+        const resp = await fetch(
+          `https://www.googleapis.com/drive/v3/files/${ph.driveFileId}?alt=media`,
+          { headers: { Authorization: `Bearer ${sheetsAccessToken}` } }
+        );
+        if (resp.ok) {
+          const blob = await resp.blob();
+          const dataUrl = await new Promise(resolve => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result);
+            reader.readAsDataURL(blob);
+          });
+          await dbPut('photos', { ...ph, dataUrl, cachedAt: new Date().toISOString() });
+        }
+      } catch(e) { console.warn('background cache failed for', ph.id, e); }
+    }
+    console.log('background cache เสร็จ');
+  } catch(e) { console.warn('_backgroundCachePhotos error', e); }
 }
 
 async function pullPhotos() {
