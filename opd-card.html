@@ -6390,7 +6390,7 @@ async function performPull() {
     for (const p of patients) await dbPut('patients', p);
     for (const v of visits) await dbPut('visits', v);
     showToast(`✅ ดึงข้อมูลสำเร็จ: ${patients.length} ผู้ป่วย กำลังดึงรูป...`, 'ok');
-    await renderHome();
+    await showHome();
     await pullPhotos();
   } catch(e) {
     showToast('❌ ดึงข้อมูลล้มเหลว: ' + e.message);
