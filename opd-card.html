@@ -6158,11 +6158,27 @@ async function getOrCreatePhotoFolder() {
   return photoDriveFolderId;
 }
 
+// ─── PROGRESS BAR ───────────────────────────────────────────────────
+function showProgress(text) {
+  let bar = document.getElementById('syncProgressBar');
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.id = 'syncProgressBar';
+    bar.style.cssText = 'position:fixed;top:56px;left:0;right:0;z-index:9999;background:#1a5276;color:#fff;font-size:13px;padding:6px 16px;text-align:center;box-shadow:0 2px 6px rgba(0,0,0,.3);';
+    document.body.appendChild(bar);
+  }
+  bar.textContent = text;
+  bar.style.display = 'block';
+}
+function hideProgress() {
+  const bar = document.getElementById('syncProgressBar');
+  if (bar) bar.style.display = 'none';
+}
+
 async function syncPhotos() {
   try {
-    showToast('📸 กำลัง Sync รูปภาพ...', 'info');
+    showProgress('📸 กำลังเตรียม Sync รูปภาพ...');
     const folderId = await getOrCreatePhotoFolder();
-    // ดึงรายชื่อไฟล์ที่มีใน Drive folder แล้ว
     const listResp = await fetch(
       `https://www.googleapis.com/drive/v3/files?q='${folderId}' in parents and trashed=false&fields=files(id,name)&pageSize=1000`,
       { headers: { Authorization: `Bearer ${sheetsAccessToken}` } }
@@ -6170,7 +6186,6 @@ async function syncPhotos() {
     const listData = await listResp.json();
     const existingFiles = new Set((listData.files || []).map(f => f.name));
 
-    // ดึงรูปทั้งหมดจาก IndexedDB
     const photos = await new Promise(resolve => {
       const tx = db.transaction('photos', 'readonly');
       const req = tx.objectStore('photos').getAll();
@@ -6178,18 +6193,19 @@ async function syncPhotos() {
       req.onerror = () => resolve([]);
     });
 
+    const toUpload = photos.filter(p => p.id && p.dataUrl && !existingFiles.has(`${p.id}__${p.visitId||''}__${p.patientId||''}__${p.photoType||''}__${p.sortOrder||0}.jpg`));
+    const total = toUpload.length;
     let uploaded = 0;
-    for (const photo of photos) {
-      if (!photo.id || !photo.dataUrl) continue; // ข้ามรูปที่ข้อมูลไม่ครบ
+
+    for (const photo of toUpload) {
+      uploaded++;
+      showProgress(`📸 Sync รูป ${uploaded}/${total}...`);
       const fileName = `${photo.id}__${photo.visitId||''}__${photo.patientId||''}__${photo.photoType||''}__${photo.sortOrder||0}.jpg`;
-      if (existingFiles.has(fileName)) continue; // ไม่อัพซ้ำ
-      // แปลง base64 เป็น blob
       const base64 = photo.dataUrl.replace(/^data:image\/\w+;base64,/, '');
       const byteChars = atob(base64);
       const byteArr = new Uint8Array(byteChars.length);
       for (let i = 0; i < byteChars.length; i++) byteArr[i] = byteChars.charCodeAt(i);
       const blob = new Blob([byteArr], { type: 'image/jpeg' });
-
       const metadata = JSON.stringify({ name: fileName, parents: [folderId] });
       const form = new FormData();
       form.append('metadata', new Blob([metadata], { type: 'application/json' }));
@@ -6199,17 +6215,18 @@ async function syncPhotos() {
         headers: { Authorization: `Bearer ${sheetsAccessToken}` },
         body: form
       });
-      uploaded++;
     }
+    hideProgress();
     showToast(`📸 Sync รูปสำเร็จ: ${uploaded} รูปใหม่`, 'ok');
   } catch (e) {
+    hideProgress();
     showToast('❌ Sync รูปล้มเหลว: ' + e.message);
   }
 }
 
 async function pullPhotos() {
   try {
-    showToast('📸 กำลังดึงรูปภาพ...', 'info');
+    showProgress('📸 กำลังเตรียมดึงรูปภาพ...');
     const folderId = await getOrCreatePhotoFolder();
     const listResp = await fetch(
       `https://www.googleapis.com/drive/v3/files?q='${folderId}' in parents and trashed=false&fields=files(id,name)&pageSize=1000`,
@@ -6217,12 +6234,16 @@ async function pullPhotos() {
     );
     const listData = await listResp.json();
     const driveFiles = listData.files || [];
-    if (driveFiles.length === 0) { showToast('ไม่มีรูปใน Drive'); return; }
+    if (driveFiles.length === 0) { hideProgress(); showToast('ไม่มีรูปใน Drive'); return; }
 
-    // เช็คว่ารูปไหนยังไม่มีใน IndexedDB
+    const total = driveFiles.length;
     let pulled = 0;
-    for (const file of driveFiles) {
-      // parse ชื่อไฟล์: id__visitId__patientId__photoType__sortOrder.jpg
+    let skipped = 0;
+
+    for (let i = 0; i < driveFiles.length; i++) {
+      const file = driveFiles[i];
+      showProgress(`📸 ดึงรูป ${i+1}/${total} (ใหม่: ${pulled})...`);
+
       const parts = file.name.replace('.jpg', '').split('__');
       const photoId = parts[0];
       const visitId = parts[1] || '';
@@ -6236,9 +6257,8 @@ async function pullPhotos() {
         req.onsuccess = () => resolve(req.result);
         req.onerror = () => resolve(null);
       });
-      if (existing) continue; // มีแล้ว ข้ามไป
+      if (existing) { skipped++; continue; }
 
-      // ดาวน์โหลดรูป
       const dlResp = await fetch(
         `https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`,
         { headers: { Authorization: `Bearer ${sheetsAccessToken}` } }
@@ -6252,8 +6272,10 @@ async function pullPhotos() {
       await dbPut('photos', { id: photoId, visitId, patientId, photoType, sortOrder, dataUrl: base64 });
       pulled++;
     }
+    hideProgress();
     showToast(`📸 ดึงรูปสำเร็จ: ${pulled} รูปใหม่`, 'ok');
   } catch (e) {
+    hideProgress();
     showToast('❌ ดึงรูปล้มเหลว: ' + e.message);
   }
 }
