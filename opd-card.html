@@ -319,9 +319,9 @@ textarea.fctl{resize:vertical;min-height:80px;}
     <button class="btn btn-outline btn-sm" onclick="showOutcomes()" style="background:rgba(255,255,255,.15);border-color:rgba(255,255,255,.3);color:#fff;">🎯 Outcomes</button>
     <button class="btn btn-outline btn-sm" onclick="exportData()" style="background:rgba(255,255,255,.15);border-color:rgba(255,255,255,.3);color:#fff;" title="Backup ข้อมูล">💾 Export</button>
     <label class="btn btn-outline btn-sm" style="background:rgba(255,255,255,.15);border-color:rgba(255,255,255,.3);color:#fff;cursor:pointer;" title="นำข้อมูลกลับเข้า">📂 Import<input type="file" accept=".json" style="display:none;" onchange="importData(this)"></label>
-    <button id="driveBtn" class="btn btn-outline btn-sm" onclick="backupToDrive()" style="background:rgba(255,255,255,.15);border-color:rgba(255,255,255,.3);color:#fff;" title="Backup ไป Google Drive">☁️ Drive</button>
-    <button id="syncBtn" class="btn btn-outline btn-sm" onclick="syncToSheets()" style="background:rgba(255,255,255,.15);border-color:rgba(255,255,255,.3);color:#fff;" title="Sync ไป Google Sheets">🔄 Sync</button>
-    <button id="pullBtn" class="btn btn-outline btn-sm" onclick="syncFromSheets()" style="background:rgba(255,255,255,.15);border-color:rgba(255,255,255,.3);color:#fff;" title="ดึงข้อมูลจาก Google Sheets">⬇️ Pull</button>
+    <button id="driveBtn" class="btn btn-outline btn-sm" onclick="backupToDrive()" style="display:none;" title="Backup JSON (legacy)">☁️ Drive</button>
+    <button id="syncBtn" class="btn btn-outline btn-sm" onclick="syncAll()" style="background:rgba(255,255,255,.15);border-color:rgba(255,255,255,.3);color:#fff;" title="Sync ข้อมูล+รูป ขึ้น Google Drive/Sheets"><span id="syncBtnLabel">🔄 Sync</span></button>
+    <button id="pullBtn" class="btn btn-outline btn-sm" onclick="syncFromSheets()" style="background:rgba(255,255,255,.15);border-color:rgba(255,255,255,.3);color:#fff;" title="ดึงข้อมูล + รูป จาก Google Drive/Sheets">⬇️ Pull</button>
     <button id="autoSyncToggle" class="btn btn-outline btn-sm" onclick="toggleAutoSync()" style="background:rgba(255,255,255,.15);border-color:rgba(255,255,255,.3);color:#fff;" title="เปิด/ปิด Auto Sync">⚡ Auto</button>
     <button id="autoLoginToggle" class="btn btn-outline btn-sm" onclick="toggleAutoLogin()" style="background:rgba(255,255,255,.15);border-color:rgba(255,255,255,.3);color:#fff;" title="เปิด/ปิด Auto Login Google">🔑 Login</button>
     <button class="btn btn-success btn-sm" onclick="openAddPatient()">+ เพิ่มผู้ป่วย</button>
@@ -3514,33 +3514,53 @@ async function readExifOrientation(file) {
   } catch (e) { dwarn('readExifOrientation error', e); }
   return 1;
 }
-// Apply orientation transform to image — returns new Blob (image/jpeg)
+// Apply orientation transform + COMPRESS image — returns new Blob (image/jpeg)
+// Compress: max 1920px on longest side, JPEG q=0.85 (lossy but visually similar)
+const PHOTO_MAX_DIM = 1920;
+const PHOTO_JPEG_Q = 0.85;
 async function applyExifOrientation(file) {
   const orientation = await readExifOrientation(file);
-  if (orientation === 1) return file; // already correct
   const img = await new Promise((res, rej) => {
     const i = new Image();
     i.onload = () => res(i);
     i.onerror = rej;
     i.src = URL.createObjectURL(file);
   });
-  const canvas = document.createElement('canvas');
+  // Compute target dimensions: scale down if longest side > PHOTO_MAX_DIM
   const swap = orientation >= 5 && orientation <= 8;
-  canvas.width = swap ? img.height : img.width;
-  canvas.height = swap ? img.width : img.height;
+  let srcW = img.width, srcH = img.height;
+  let dispW = swap ? srcH : srcW;
+  let dispH = swap ? srcW : srcH;
+  const longest = Math.max(dispW, dispH);
+  let scale = 1;
+  if (longest > PHOTO_MAX_DIM) scale = PHOTO_MAX_DIM / longest;
+  const outW = Math.round(dispW * scale);
+  const outH = Math.round(dispH * scale);
+  // If no rotation needed AND no scaling needed → return original (avoid lossy re-encode)
+  if (orientation === 1 && scale === 1 && file.size < 500 * 1024) {
+    URL.revokeObjectURL(img.src);
+    return file;
+  }
+  const canvas = document.createElement('canvas');
+  canvas.width = outW;
+  canvas.height = outH;
   const ctx = canvas.getContext('2d');
+  // Apply rotation transform to the OUTPUT canvas space, scaled
+  const sx = outW / dispW; // = scale
+  // For rotation, we need to map original coords. Easier: apply transform then drawImage with scale
   switch (orientation) {
-    case 2: ctx.transform(-1, 0, 0, 1, img.width, 0); break;
-    case 3: ctx.transform(-1, 0, 0, -1, img.width, img.height); break;
-    case 4: ctx.transform(1, 0, 0, -1, 0, img.height); break;
-    case 5: ctx.transform(0, 1, 1, 0, 0, 0); break;
-    case 6: ctx.transform(0, 1, -1, 0, img.height, 0); break;
-    case 7: ctx.transform(0, -1, -1, 0, img.height, img.width); break;
-    case 8: ctx.transform(0, -1, 1, 0, 0, img.width); break;
+    case 2: ctx.transform(-sx, 0, 0, sx, outW, 0); break;
+    case 3: ctx.transform(-sx, 0, 0, -sx, outW, outH); break;
+    case 4: ctx.transform(sx, 0, 0, -sx, 0, outH); break;
+    case 5: ctx.transform(0, sx, sx, 0, 0, 0); break;
+    case 6: ctx.transform(0, sx, -sx, 0, outW, 0); break;
+    case 7: ctx.transform(0, -sx, -sx, 0, outW, outH); break;
+    case 8: ctx.transform(0, -sx, sx, 0, 0, outH); break;
+    default: ctx.scale(sx, sx); break; // orientation 1
   }
   ctx.drawImage(img, 0, 0);
   URL.revokeObjectURL(img.src);
-  return await new Promise(res => canvas.toBlob(b => res(b || file), 'image/jpeg', 0.92));
+  return await new Promise(res => canvas.toBlob(b => res(b || file), 'image/jpeg', PHOTO_JPEG_Q));
 }
 
 function guessPhotoType(filename) {
@@ -6642,6 +6662,8 @@ let isSyncing = false;
 let sheetsTokenCallback = null;
 
 // ─── AUTO SYNC ───────────────────────────────────────────────────────
+let _lastSyncAt = localStorage.getItem('lastSyncAt') || null;
+let _syncStatusState = 'idle'; // idle | syncing | error | offline
 let autoSyncEnabled = localStorage.getItem('autoSyncEnabled') === 'true';
 
 function toggleAutoSync() {
@@ -6650,6 +6672,50 @@ function toggleAutoSync() {
   updateAutoSyncBtn();
   showToast(autoSyncEnabled ? '⚡ Auto Sync เปิดแล้ว' : '⚡ Auto Sync ปิดแล้ว', 'ok');
 }
+
+function updateSyncStatus() {
+  const label = document.getElementById('syncBtnLabel');
+  if (!label) return;
+  const isOnline = navigator.onLine;
+  if (!isOnline) {
+    label.textContent = '📴 Offline';
+    return;
+  }
+  if (_syncStatusState === 'syncing') {
+    label.textContent = '🔄 กำลัง sync...';
+    return;
+  }
+  if (_syncStatusState === 'error') {
+    label.textContent = '⚠️ Sync ล้มเหลว';
+    return;
+  }
+  // ยังไม่ login ก็แสดง Sync ปกติ — กดแล้ว trigger login auto
+  if (!sheetsAccessToken) {
+    label.textContent = _lastSyncAt ? ('🔄 Sync ' + _fmtSyncTime(_lastSyncAt)) : '🔄 Sync';
+    return;
+  }
+  if (_lastSyncAt) {
+    label.textContent = '✓ Synced ' + _fmtSyncTime(_lastSyncAt);
+  } else {
+    label.textContent = '🔄 Sync';
+  }
+}
+function _fmtSyncTime(iso) {
+  try {
+    const d = new Date(iso);
+    const now = new Date();
+    const diff = (now - d) / 1000; // seconds
+    if (diff < 60) return '(เมื่อกี้)';
+    if (diff < 3600) return `(${Math.floor(diff/60)} นาทีที่แล้ว)`;
+    if (diff < 86400) return `(${Math.floor(diff/3600)} ชม.ที่แล้ว)`;
+    return `(${Math.floor(diff/86400)} วันที่แล้ว)`;
+  } catch(e) { return ''; }
+}
+// Refresh status every 30s to update time-since labels
+setInterval(() => { try { updateSyncStatus(); } catch(e){} }, 30000);
+// Listen for online/offline changes
+window.addEventListener('online',  () => updateSyncStatus());
+window.addEventListener('offline', () => updateSyncStatus());
 
 function updateAutoSyncBtn() {
   const btn = document.getElementById('autoSyncToggle');
@@ -6665,16 +6731,67 @@ function updateAutoSyncBtn() {
   }
 }
 
+// ── COMBINED SYNC: Sheets + Drive photos ─────────────────────────────
+async function performFullSync(_isRetry = false) {
+  _syncStatusState = 'syncing';
+  updateSyncStatus();
+  try {
+    // Sheets (patient + visit data)
+    await performSheetsSync();
+    // Drive photos (เฉพาะที่ยังไม่ upload) — ปล่อย 401 bubble ขึ้นไปให้ outer catch retry
+    try {
+      await syncPhotos();
+    } catch(e) {
+      if (/401|หมดอายุ|UNAUTHENTICATED/i.test(e.message || '')) throw e;
+      dwarn('photo sync failed (non-auth)', e);
+    }
+    _lastSyncAt = new Date().toISOString();
+    localStorage.setItem('lastSyncAt', _lastSyncAt);
+    _syncStatusState = 'idle';
+  } catch (e) {
+    dwarn('performFullSync failed', e);
+    // ถ้า token หมดอายุ + ยังไม่เคย retry → ขอ token ใหม่อัตโนมัติแล้ว retry
+    if (!_isRetry && /401|หมดอายุ|UNAUTHENTICATED/i.test(e.message || '')) {
+      sheetsAccessToken = null;
+      driveAccessToken = null;
+      _syncStatusState = 'idle';
+      updateSyncStatus();
+      showToast('🔑 Token หมดอายุ — กรุณา login ใหม่', 'info');
+      if (!sheetsTokenClient) initSheetsClient();
+      sheetsTokenCallback = () => performFullSync(true);
+      // ไม่ใส่ prompt → Google จะแสดง popup ให้ login ใหม่ (silent mode fail บ่อยเมื่อ token หมดอายุ)
+      sheetsTokenClient.requestAccessToken();
+      return;
+    }
+    _syncStatusState = 'error';
+    showToast('❌ Sync ล้มเหลว: ' + e.message, 'error');
+  }
+  updateSyncStatus();
+}
+
+// Manual sync — รวมรูป + ข้อมูล (ปุ่ม 🔄 Sync)
+async function syncAll() {
+  if (isSyncing) { showToast('กำลัง sync อยู่...'); return; }
+  if (!sheetsTokenClient) initSheetsClient();
+  if (!sheetsAccessToken) {
+    sheetsTokenCallback = performFullSync;
+    sheetsTokenClient.requestAccessToken({ prompt: '' });
+    return;
+  }
+  await performFullSync();
+}
+
+// Auto sync (หลัง save) — รวมรูป + ข้อมูล
 async function autoSync() {
   if (!autoSyncEnabled) return;
   if (isSyncing) return;
   if (!sheetsTokenClient) initSheetsClient();
   if (!sheetsAccessToken) {
-    sheetsTokenCallback = performSheetsSync;
+    sheetsTokenCallback = performFullSync;
     sheetsTokenClient.requestAccessToken({ prompt: '' });
     return;
   }
-  await performSheetsSync();
+  await performFullSync();
 }
 
 // ─── AUTO LOGIN ──────────────────────────────────────────────────────
@@ -6733,6 +6850,7 @@ function autoLoginIfEnabled() {
 
 // อัพเดต button state หลัง page load
 window.addEventListener('load', () => {
+  setTimeout(updateSyncStatus, 700);
   setTimeout(updateAutoSyncBtn, 600);
   setTimeout(updateAutoLoginBtn, 600);
 });
@@ -6743,8 +6861,20 @@ function initSheetsClient() {
     client_id: DRIVE_CLIENT_ID,
     scope: 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file',
     callback: async (resp) => {
-      if (resp.error) { showToast('Sheets login ไม่สำเร็จ: ' + resp.error); return; }
-      if (sheetsTokenCallback) { await sheetsTokenCallback(); sheetsTokenCallback = null; }
+      if (resp.error) {
+        showToast('Sheets login ไม่สำเร็จ: ' + (resp.error_description || resp.error), 'error');
+        sheetsTokenCallback = null;
+        _syncStatusState = 'error';
+        updateSyncStatus();
+        return;
+      }
+      sheetsAccessToken = resp.access_token;
+      if (sheetsTokenCallback) {
+        const cb = sheetsTokenCallback;
+        sheetsTokenCallback = null;
+        try { await cb(); }
+        catch(e) { dwarn('token callback error', e); }
+      }
     }
   });
 }
@@ -6758,6 +6888,11 @@ async function getOrCreatePhotoFolder() {
     `https://www.googleapis.com/drive/v3/files?q=name='OPD-Photos' and mimeType='application/vnd.google-apps.folder' and trashed=false&fields=files(id,name)`,
     { headers: { Authorization: `Bearer ${sheetsAccessToken}` } }
   );
+  if (searchResp.status === 401) {
+    sheetsAccessToken = null;
+    throw new Error('Drive token หมดอายุ');
+  }
+  if (!searchResp.ok) throw new Error('Drive search error: ' + searchResp.status);
   const searchData = await searchResp.json();
   if (searchData.files && searchData.files.length > 0) {
     photoDriveFolderId = searchData.files[0].id;
@@ -6799,6 +6934,11 @@ async function syncPhotos() {
       `https://www.googleapis.com/drive/v3/files?q='${folderId}' in parents and trashed=false&fields=files(id,name)&pageSize=1000`,
       { headers: { Authorization: `Bearer ${sheetsAccessToken}` } }
     );
+    if (listResp.status === 401) {
+      sheetsAccessToken = null;
+      throw new Error('Drive token หมดอายุ');
+    }
+    if (!listResp.ok) throw new Error('Drive list error: ' + listResp.status);
     const listData = await listResp.json();
     const existingFiles = new Set((listData.files || []).map(f => f.name));
 
@@ -6834,16 +6974,23 @@ async function syncPhotos() {
       const form = new FormData();
       form.append('metadata', new Blob([metadata], { type: 'application/json' }));
       form.append('file', blob);
-      await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+      const upResp = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
         method: 'POST',
         headers: { Authorization: `Bearer ${sheetsAccessToken}` },
         body: form
       });
+      if (!upResp.ok) {
+        dwarn('Photo upload failed:', upResp.status);
+      }
     }
     hideProgress();
     showToast(`📸 Sync รูปสำเร็จ: ${uploaded} รูปใหม่`, 'ok');
   } catch (e) {
     hideProgress();
+    // Re-throw 401 errors เพื่อให้ performFullSync handle retry; อื่นๆ ให้แสดง toast เฉยๆ
+    if (/401|หมดอายุ|UNAUTHENTICATED/i.test(e.message || '')) {
+      throw e;
+    }
     showToast('❌ Sync รูปล้มเหลว: ' + e.message);
   }
 }
@@ -6951,12 +7098,21 @@ async function performSheetsSync() {
       headers: { 'Authorization': `Bearer ${sheetsAccessToken}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(batchBody)
     });
-    if (resp.status === 401) { sheetsAccessToken = null; isSyncing = false; return; }
-    if (!resp.ok) throw new Error('Sheets API error: ' + resp.status);
-    showToast('✅ Sync ข้อมูลสำเร็จ กำลัง Sync รูป...', 'ok');
+    if (resp.status === 401) {
+      sheetsAccessToken = null;
+      isSyncing = false;
+      throw new Error('Token หมดอายุ — กรุณากด Sync อีกครั้งเพื่อ login ใหม่');
+    }
+    if (!resp.ok) {
+      const respText = await resp.text();
+      throw new Error('Sheets API error: ' + resp.status + ' — ' + respText.slice(0, 200));
+    }
+    showToast(`✅ Sync ข้อมูลสำเร็จ (${patients.length} pt, ${visits.length} v) กำลัง Sync รูป...`, 'ok');
     await syncPhotos();
   } catch(e) {
-    showToast('❌ Sync ล้มเหลว: ' + e.message);
+    // Re-throw เพื่อให้ performFullSync จัดการ retry (กรณี 401 token หมดอายุ)
+    isSyncing = false;
+    throw e;
   } finally {
     isSyncing = false;
   }
@@ -6966,7 +7122,10 @@ async function ensureSheetsExist() {
   const resp = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}`, {
     headers: { 'Authorization': `Bearer ${sheetsAccessToken}` }
   });
-  if (!resp.ok) return;
+  if (!resp.ok) {
+    dwarn('ensureSheetsExist failed:', resp.status);
+    return;
+  }
   const data = await resp.json();
   const existing = data.sheets.map(s => s.properties.title);
   const toCreate = ['Patients','Visits'].filter(n => !existing.includes(n));
