@@ -1074,6 +1074,11 @@ textarea.fctl{resize:vertical;min-height:80px;}
 
 </script>
 <script>
+// DEBUG flag — gate PII logging
+const DEBUG = false;
+function dlog(...args) { if (DEBUG) console.log(...args); }
+function dwarn(...args) { if (DEBUG) console.warn(...args); }
+
 // ─── DB ───────────────────────────────────────────────────────────
 const DB_NAME = 'OPDCardDB', DB_VER = 4;
 let db;
@@ -1121,11 +1126,11 @@ function initDB() {
                 intraComp: v.intraComp || '',
                 addOn: v.addOn || ''
               }];
-              try { cs.update(v); } catch(err) { console.warn('migrate skip', v.id, err); }
+              try { cs.update(v); } catch(err) { dwarn('migrate skip', v.id, err); }
             }
             cs.continue();
           };
-          cur.onerror = err => console.warn('migration cursor error', err);
+          cur.onerror = err => dwarn('migration cursor error', err);
         } catch(err) { console.error('Migration v3 failed:', err); }
       }
       // ── v4: driveFileId + cachedAt fields (no structural change needed, just version bump) ──
@@ -1201,9 +1206,58 @@ const PHOTO_LOADING = 'data:image/svg+xml,' + encodeURIComponent(`<svg width="16
 let _tokenExpiredToastShown = false;
 
 // ดึง src ของรูป: local → Drive → placeholder
+
+// Migrate legacy base64 photos to Blob storage — runs once on app start
+async function migratePhotosToBlob() {
+  try {
+    const all = await dbGetAll('photos');
+    const legacy = all.filter(p => p.dataUrl && !p.blob);
+    if (legacy.length === 0) {
+      localStorage.setItem('photoMigrationDone_v1', '1');
+      return;
+    }
+    showToast(`🔄 อัพเกรดที่เก็บรูปภาพ 0/${legacy.length}...`, 'info');
+    let done = 0;
+    for (const p of legacy) {
+      try {
+        const blob = await dataUrlToBlob(p.dataUrl);
+        const updated = { ...p, blob };
+        delete updated.dataUrl; // remove legacy field
+        await dbPut('photos', updated);
+        done++;
+        if (done % 20 === 0) showToast(`🔄 อัพเกรดรูป ${done}/${legacy.length}...`, 'info');
+      } catch (e) {
+        dwarn('migrate photo failed', p.id, e);
+      }
+    }
+    localStorage.setItem('photoMigrationDone_v1', '1');
+    showToast(`✓ อัพเกรดรูปเสร็จ: ${done}/${legacy.length}`, 'ok');
+  } catch (e) {
+    dwarn('migratePhotosToBlob error', e);
+  }
+}
+// Convert dataUrl (base64) → Blob
+async function dataUrlToBlob(dataUrl) {
+  const res = await fetch(dataUrl);
+  return await res.blob();
+}
+// Convert Blob → dataUrl (base64) for legacy paths that still need it (e.g. Drive upload)
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+}
 async function getPhotoSrc(photo) {
   if (!photo) return PHOTO_PLACEHOLDER;
-  // มี dataUrl อยู่แล้ว (รูปใหม่หรือ cache)
+  // มี blob (รูปใหม่ format) → สร้าง object URL (cached on photo object)
+  if (photo.blob) {
+    if (!photo._url) photo._url = URL.createObjectURL(photo.blob);
+    return photo._url;
+  }
+  // มี dataUrl อยู่แล้ว (legacy รูปเก่าหรือ cache)
   if (photo.dataUrl) return photo.dataUrl;
   // มี driveFileId → ลองดึงจาก Drive
   if (photo.driveFileId) {
@@ -1240,7 +1294,7 @@ async function getPhotoSrc(photo) {
           setTimeout(() => { _tokenExpiredToastShown = false; }, 10000);
         }
       }
-    } catch(e) { console.warn('getPhotoSrc fetch failed', e); }
+    } catch(e) { dwarn('getPhotoSrc fetch failed', e); }
   }
   // ไม่มีเน็ต หรือ fetch ไม่สำเร็จ
   return PHOTO_PLACEHOLDER;
@@ -1259,8 +1313,8 @@ async function cleanExpiredCache() {
         cleaned++;
       }
     }
-    if (cleaned > 0) console.log(`cleanExpiredCache: cleared ${cleaned} photos`);
-  } catch(e) { console.warn('cleanExpiredCache error', e); }
+    if (cleaned > 0) dlog(`cleanExpiredCache: cleared ${cleaned} photos`);
+  } catch(e) { dwarn('cleanExpiredCache error', e); }
 }
 
 // ─── STATE ──────────────────────────────────────────────────────────
@@ -1910,16 +1964,20 @@ function _renderProcStatsPanel(procedureName, stats) {
 
 
 async function loadHomePatients(nameFilter='', dateFrom='', dateTo='', compOnly='', procedureFilter='', drConcernOnly=false, ptConcernOnly=false, compOngoing=false, drCOngoing=false, ptCOngoing=false, skinCompOngoing=false, allCompOngoing=false, forcedPatientIds=null, forcedLabel='') {
-  let patients = await dbGetAll('patients');
+  let patients = (await dbGetAll('patients')).filter(notDeleted);
 
   // ถ้ามี forcedPatientIds → กรองเฉพาะผู้ป่วยที่กำหนด แล้ว fall through ไป render
   if (forcedPatientIds) {
     patients = patients.filter(p => forcedPatientIds.has(p.id));
-    const allVisits2 = await dbGetAll('visits');
+    const allVisits2 = (await dbGetAll('visits')).filter(notDeleted);
     const latestVisitMap2 = {};
+    // Build visitsByPatient map once (perf: avoid N queries)
+    const visitsByPatient2 = new Map();
     for (const v of allVisits2) {
       if (!latestVisitMap2[v.patientId] || v.date > latestVisitMap2[v.patientId].date)
         latestVisitMap2[v.patientId] = v;
+      if (!visitsByPatient2.has(v.patientId)) visitsByPatient2.set(v.patientId, []);
+      visitsByPatient2.get(v.patientId).push(v);
     }
     const el2 = document.getElementById('patientList');
     const filterEl2 = document.getElementById('filterResult');
@@ -1928,8 +1986,8 @@ async function loadHomePatients(nameFilter='', dateFrom='', dateTo='', compOnly=
       el2.innerHTML = `<div class="empty"><div class="empty-icon">👤</div><div class="empty-txt">ไม่พบผู้ป่วย</div></div>`;
       return;
     }
-    const rows2 = await Promise.all(patients.map(async (p, idx) => {
-      const visits = await dbGetByIndex('visits','patientId', p.id);
+    const rows2 = patients.map((p, idx) => {
+      const visits = visitsByPatient2.get(p.id) || [];
       const sortedV = [...visits].sort((a,b) => b.date.localeCompare(a.date));
       const latestV = sortedV[0];
       let compBadge='', intraBadge='', drBadge='', ptBadge='';
@@ -1955,7 +2013,7 @@ async function loadHomePatients(nameFilter='', dateFrom='', dateTo='', compOnly=
         </div>
         <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;justify-content:flex-end;">${compBadge}${intraBadge}${drBadge}${ptBadge}</div>
       </div>`;
-    }));
+    });
     el2.innerHTML = rows2.join('');
     return;
   }
@@ -1970,7 +2028,13 @@ async function loadHomePatients(nameFilter='', dateFrom='', dateTo='', compOnly=
   }
 
   // load all visits once
-  let allVisits = await dbGetAll('visits');
+  let allVisits = (await dbGetAll('visits')).filter(notDeleted);
+  // Build visitsByPatient map once (perf: avoid N dbGetByIndex queries downstream)
+  const visitsByPatient = new Map();
+  for (const v of allVisits) {
+    if (!visitsByPatient.has(v.patientId)) visitsByPatient.set(v.patientId, []);
+    visitsByPatient.get(v.patientId).push(v);
+  }
   let dateFiltered = false;
   let filterLabels = [];
 
@@ -2134,8 +2198,8 @@ async function loadHomePatients(nameFilter='', dateFrom='', dateTo='', compOnly=
     return;
   }
 
-  const rows = await Promise.all(patients.map(async (p, _pIdx) => {
-    const visits = await dbGetByIndex('visits','patientId', p.id);
+  const rows = patients.map((p, _pIdx) => {
+    const visits = visitsByPatient.get(p.id) || [];
     const ops = visits.filter(v => _OP_TYPES.includes(v.type)).reduce((sum, v) => sum + (v.procedures?.length || 1), 0);
     const skinVCount = visits.filter(v => _SKIN_TYPES.includes(v.type) && v.skinProcedures?.length).length;
     const pCompVisits = visits.filter(v => hasComp(v));
@@ -2189,7 +2253,7 @@ async function loadHomePatients(nameFilter='', dateFrom='', dateTo='', compOnly=
           ${skinVCount ? `<span class="p-badge" style="background:#d5f5e3;color:#1e8449;">${skinVCount} Skin</span>` : ''}
         </div>
       </div>`;
-  }));
+  });
   el.innerHTML = rows.join('');
 }
 
@@ -2198,7 +2262,7 @@ async function renderPatientPage(patientId) {
   const p = await dbGet('patients', patientId);
   if (!p) { showHome(); return; }
 
-  const visits = await dbGetByIndex('visits','patientId', patientId);
+  const visits = (await dbGetByIndex('visits','patientId', patientId)).filter(notDeleted);
   visits.sort((a,b) => new Date(b.date) - new Date(a.date));
 
   const uniqueDates= new Set(visits.map(v => v.date)).size;
@@ -2581,7 +2645,7 @@ async function renderVisitPage(visitId) {
   if (!v) { goBackToPatient(); return; }
 
   const p = await dbGet('patients', v.patientId);
-  const photos = await dbGetByIndex('photos','visitId', visitId);
+  const photos = (await dbGetByIndex('photos','visitId', visitId)).filter(notDeleted);
 
   const vIsOp   = _OP_TYPES.includes(v.type);
   const vIsFU   = _FU_TYPES.includes(v.type);
@@ -3364,18 +3428,19 @@ async function _finalizeSaveVisit(obj, patientId) {
   for (let pi = 0; pi < pendingPhotos.length; pi++) {
     const ph = pendingPhotos[pi];
     try {
-      const dataUrl = await fileToDataUrl(ph.file);
+      // Apply EXIF rotation (auto-correct phone photos) — File extends Blob
+      const photoBlob = await applyExifOrientation(ph.file);
       await dbPut('photos', {
         id:         uid(),
         visitId:    id,
         patientId,
         photoType:  ph.type,
         sortOrder:  baseOrder + pi,
-        dataUrl,
+        blob:       photoBlob,
         createdAt:  new Date().toISOString()
       });
     } catch (err) {
-      console.warn('skip photo', ph.file?.name, err);
+      dwarn('skip photo', ph.file?.name, err);
       photoFailCount++;
     }
   }
@@ -3414,9 +3479,78 @@ function handleDrop(e) {
   if (files.length) handlePhotoSelect(files);
 }
 
+// Read EXIF orientation from JPEG — returns 1-8, or 1 if not found
+async function readExifOrientation(file) {
+  try {
+    const buf = await file.slice(0, 64*1024).arrayBuffer();
+    const view = new DataView(buf);
+    if (view.getUint16(0) !== 0xFFD8) return 1; // not JPEG
+    let offset = 2;
+    while (offset < view.byteLength) {
+      const marker = view.getUint16(offset);
+      offset += 2;
+      if (marker === 0xFFE1) {
+        // APP1 marker — check Exif header
+        if (view.getUint32(offset + 2) !== 0x45786966) return 1; // "Exif"
+        const tiffStart = offset + 8;
+        const little = view.getUint16(tiffStart) === 0x4949;
+        const get16 = (o) => view.getUint16(o, little);
+        const get32 = (o) => view.getUint32(o, little);
+        const ifdOffset = get32(tiffStart + 4) + tiffStart;
+        const tags = get16(ifdOffset);
+        for (let i = 0; i < tags; i++) {
+          const tagOffset = ifdOffset + 2 + i * 12;
+          if (get16(tagOffset) === 0x0112) {
+            return get16(tagOffset + 8);
+          }
+        }
+        return 1;
+      } else if ((marker & 0xFF00) !== 0xFF00) {
+        return 1; // not a marker
+      } else {
+        offset += view.getUint16(offset);
+      }
+    }
+  } catch (e) { dwarn('readExifOrientation error', e); }
+  return 1;
+}
+// Apply orientation transform to image — returns new Blob (image/jpeg)
+async function applyExifOrientation(file) {
+  const orientation = await readExifOrientation(file);
+  if (orientation === 1) return file; // already correct
+  const img = await new Promise((res, rej) => {
+    const i = new Image();
+    i.onload = () => res(i);
+    i.onerror = rej;
+    i.src = URL.createObjectURL(file);
+  });
+  const canvas = document.createElement('canvas');
+  const swap = orientation >= 5 && orientation <= 8;
+  canvas.width = swap ? img.height : img.width;
+  canvas.height = swap ? img.width : img.height;
+  const ctx = canvas.getContext('2d');
+  switch (orientation) {
+    case 2: ctx.transform(-1, 0, 0, 1, img.width, 0); break;
+    case 3: ctx.transform(-1, 0, 0, -1, img.width, img.height); break;
+    case 4: ctx.transform(1, 0, 0, -1, 0, img.height); break;
+    case 5: ctx.transform(0, 1, 1, 0, 0, 0); break;
+    case 6: ctx.transform(0, 1, -1, 0, img.height, 0); break;
+    case 7: ctx.transform(0, -1, -1, 0, img.height, img.width); break;
+    case 8: ctx.transform(0, -1, 1, 0, 0, img.width); break;
+  }
+  ctx.drawImage(img, 0, 0);
+  URL.revokeObjectURL(img.src);
+  return await new Promise(res => canvas.toBlob(b => res(b || file), 'image/jpeg', 0.92));
+}
+
+function guessPhotoType(filename) {
+  // จากชื่อไฟล์: หากมีคำว่า after/post/fu/followup → 'after', อื่น ๆ → 'before'
+  if (/after|post|fu[\W_]|followup|follow-up/i.test(filename || '')) return 'after';
+  return 'before';
+}
 function handlePhotoSelect(files) {
   for (const file of files) {
-    pendingPhotos.push({ file, type: 'before', objectUrl: URL.createObjectURL(file) });
+    pendingPhotos.push({ file, type: guessPhotoType(file.name), objectUrl: URL.createObjectURL(file) });
   }
   renderPendingPhotos();
 }
@@ -3424,8 +3558,26 @@ function handlePhotoSelect(files) {
 function renderPendingPhotos() {
   const grid = document.getElementById('photoPendingGrid');
   if (!pendingPhotos.length) { grid.innerHTML = ''; return; }
-  grid.innerHTML = pendingPhotos.map((ph, i) => `
-    <div class="ph-pending">
+  // ensure selected flag exists
+  pendingPhotos.forEach(ph => { if (ph.selected === undefined) ph.selected = false; });
+  const selCount = pendingPhotos.filter(p => p.selected).length;
+  const allSel = selCount === pendingPhotos.length;
+  const bulkBar = `
+    <div class="ph-bulk-bar" style="grid-column:1/-1;display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px 10px;background:#eaf4fb;border-radius:6px;margin-bottom:6px;font-size:13px;">
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-weight:600;">
+        <input type="checkbox" ${allSel?'checked':''} onchange="toggleAllPendingPhotos(this.checked)">
+        เลือกทั้งหมด (${selCount}/${pendingPhotos.length})
+      </label>
+      <span style="color:var(--text-light);">|</span>
+      <span style="color:var(--text-light);font-size:12px;">เปลี่ยน type ที่เลือก →</span>
+      <button type="button" onclick="bulkSetPendingType('before')" ${selCount?'':'disabled'} style="padding:4px 10px;border-radius:6px;border:1px solid var(--border);background:#fff;cursor:${selCount?'pointer':'not-allowed'};font-size:12px;opacity:${selCount?1:.5};">Before</button>
+      <button type="button" onclick="bulkSetPendingType('after')" ${selCount?'':'disabled'} style="padding:4px 10px;border-radius:6px;border:1px solid var(--border);background:#fff;cursor:${selCount?'pointer':'not-allowed'};font-size:12px;opacity:${selCount?1:.5};">After</button>
+      <button type="button" onclick="bulkSetPendingType('follow-up')" ${selCount?'':'disabled'} style="padding:4px 10px;border-radius:6px;border:1px solid var(--border);background:#fff;cursor:${selCount?'pointer':'not-allowed'};font-size:12px;opacity:${selCount?1:.5};">Follow-up</button>
+      <button type="button" onclick="bulkSetPendingType('other')" ${selCount?'':'disabled'} style="padding:4px 10px;border-radius:6px;border:1px solid var(--border);background:#fff;cursor:${selCount?'pointer':'not-allowed'};font-size:12px;opacity:${selCount?1:.5};">Other</button>
+    </div>`;
+  grid.innerHTML = bulkBar + pendingPhotos.map((ph, i) => `
+    <div class="ph-pending" style="position:relative;${ph.selected?'outline:3px solid #2e86c1;':''}">
+      <input type="checkbox" class="ph-sel" ${ph.selected?'checked':''} onchange="togglePendingPhotoSelect(${i}, this.checked)" style="position:absolute;top:6px;left:6px;z-index:3;width:18px;height:18px;cursor:pointer;background:#fff;border-radius:3px;">
       <img src="${ph.objectUrl}" alt="" onclick="openPhPreview('${ph.objectUrl}')" title="คลิกเพื่อขยายดู">
       <button class="ph-rm" onclick="removePendingPhoto(${i})">×</button>
       <select class="ph-type-sel" onchange="setPendingPhotoType(${i}, this.value)">
@@ -3436,6 +3588,18 @@ function renderPendingPhotos() {
         <option value="other" ${ph.type==='other'?'selected':''}>Other</option>
       </select>
     </div>`).join('');
+}
+function togglePendingPhotoSelect(i, checked) {
+  if (pendingPhotos[i]) pendingPhotos[i].selected = checked;
+  renderPendingPhotos();
+}
+function toggleAllPendingPhotos(checked) {
+  pendingPhotos.forEach(ph => ph.selected = checked);
+  renderPendingPhotos();
+}
+function bulkSetPendingType(type) {
+  pendingPhotos.forEach(ph => { if (ph.selected) ph.type = type; });
+  renderPendingPhotos();
 }
 
 function removePendingPhoto(i) {
@@ -3583,14 +3747,18 @@ async function downloadAllPhotos(visitId) {
   const p = v ? await dbGet('patients', v.patientId) : null;
   const nameBase = p ? p.name.replace(/\s+/g,'_') : 'patient';
   const date = v ? v.date : 'date';
-  photos.forEach((ph, i) => {
+  showToast(`⏳ กำลังเตรียมรูป ${photos.length} รูป...`, 'info');
+  for (let i = 0; i < photos.length; i++) {
+    const ph = photos[i];
+    const src = await getPhotoSrc(ph);
+    if (src === PHOTO_PLACEHOLDER) continue;
     setTimeout(() => {
       const a = document.createElement('a');
-      a.href = ph.dataUrl;
+      a.href = src;
       a.download = `${nameBase}_${date}_${ph.photoType||'photo'}_${i+1}.jpg`;
       a.click();
     }, i * 120);
-  });
+  }
   showToast(`กำลังดาวน์โหลด ${photos.length} รูป...`, 'ok');
 }
 
@@ -3712,7 +3880,7 @@ async function openCrossVisitCompare(patientId) {
     _xvSelected = [];
 
     // โหลดรูปที่ยังไม่มี dataUrl จาก Drive พร้อม loading indicator
-    const missingPhotos = photos.filter(ph => !ph.dataUrl && ph.driveFileId);
+    const missingPhotos = photos.filter(ph => !ph.dataUrl && !ph.blob && ph.driveFileId);
     if (missingPhotos.length > 0) {
       showProgress(`📸 กำลังโหลดรูปสำหรับเปรียบเทียบ 0/${missingPhotos.length}...`);
       let loaded = 0;
@@ -3772,10 +3940,10 @@ async function openCrossVisitCompare(patientId) {
                        : ph.photoType === 'after' ? 'After'
                        : (ph.photoType || 'Photo');
         const fullLabel = `${visitLabel} · ${typeLbl}`;
-        const fullLabelEsc = esc(fullLabel).replace(/"/g,'&quot;');
-        const src = ph.dataUrl || PHOTO_PLACEHOLDER;
+        const src = ph.dataUrl || (ph.blob ? (ph._url ||= URL.createObjectURL(ph.blob)) : PHOTO_PLACEHOLDER);
         const srcEsc = src.replace(/"/g,'&quot;');
-        return `<div class="xv-card" data-xv-id="${esc(ph.id)}" onclick="_xvSelectPhoto('${esc(ph.id)}','${srcEsc}','${fullLabelEsc}',event)" style="position:relative;border:2px solid var(--border);border-radius:8px;overflow:hidden;cursor:pointer;background:#fff;transition:border-color .15s;">
+        // src kept on <img> only; onclick uses delegated listener via data-xv-id
+        return `<div class="xv-card" data-xv-id="${esc(ph.id)}" data-xv-label="${esc(fullLabel)}" style="position:relative;border:2px solid var(--border);border-radius:8px;overflow:hidden;cursor:pointer;background:#fff;transition:border-color .15s;">
           <img src="${srcEsc}" style="width:100%;aspect-ratio:3/4;object-fit:cover;display:block;pointer-events:none;">
           <div style="padding:5px 8px;font-size:11px;color:var(--text-light);background:#fff;border-top:1px solid var(--border);">${esc(typeLbl)}</div>
         </div>`;
@@ -3811,8 +3979,23 @@ async function openCrossVisitCompare(patientId) {
         </div>
       </div>`;
     document.body.appendChild(modal);
+    // delegated click handler — lazy-resolve photo src to avoid DOM bloat with inline data URLs
+    modal.addEventListener('click', async (ev) => {
+      const card = ev.target.closest('.xv-card[data-xv-id]');
+      if (!card) return;
+      const id = card.dataset.xvId;
+      const label = card.dataset.xvLabel || '';
+      // get src from in-memory photos array first (already loaded)
+      const ph = photos.find(p => p.id === id);
+      let src;
+      if (ph && ph.dataUrl) src = ph.dataUrl;
+      else if (ph && ph.blob) src = (ph._url ||= URL.createObjectURL(ph.blob));
+      else { const fresh = await dbGet('photos', id); src = fresh && (fresh.dataUrl || (fresh.blob ? URL.createObjectURL(fresh.blob) : '')) || PHOTO_PLACEHOLDER; }
+      _xvSelectPhoto(id, src, label, ev);
+    });
   } catch (err) {
-    console.error('openCrossVisitCompare error:', err);
+    hideProgress();
+    dwarn('openCrossVisitCompare error:', err);
     alert('เกิดข้อผิดพลาด: ' + (err.message || err));
   }
 }
@@ -3964,7 +4147,7 @@ function cmpTouchMove(e) {
 async function onNavSearch(val) {
   const dd = document.getElementById('searchDD');
   if (!val.trim()) { dd.classList.remove('show'); return; }
-  let patients = await dbGetAll('patients');
+  let patients = (await dbGetAll('patients')).filter(notDeleted);
   const q = val.toLowerCase();
   patients = patients.filter(p =>
     p.name.toLowerCase().includes(q) || (p.hn||'').toLowerCase().includes(q)
@@ -4007,7 +4190,39 @@ function closeConfirm() {
 }
 
 function confirmDeletePatient(id) {
-  showConfirm('ลบผู้ป่วย', 'ข้อมูลทั้งหมดของผู้ป่วยรายนี้ (visits, รูปภาพ) จะถูกลบถาวร', async () => {
+  showConfirm('ลบผู้ป่วย', 'ข้อมูลทั้งหมดของผู้ป่วยรายนี้จะถูกลบ (มี 30 วันให้กู้คืน)', async () => {
+    // Soft delete branch
+    try {
+      const patSnap = await softDelete('patients', id);
+      if (!patSnap) return;
+      const visits = await dbGetByIndex('visits','patientId', id);
+      const visitSnaps = [];
+      for (const v of visits) {
+        visitSnaps.push({ ...v });
+        v.deletedAt = patSnap.deletedAt;
+        await dbPut('visits', v);
+      }
+      const photos = await dbGetByIndex('photos','patientId', id);
+      const photoSnaps = [];
+      for (const ph of photos) {
+        photoSnaps.push({ ...ph });
+        ph.deletedAt = patSnap.deletedAt;
+        await dbPut('photos', ph);
+      }
+      showHome();
+      showUndoToast(`ลบผู้ป่วยแล้ว (${visitSnaps.length} visits, ${photoSnaps.length} รูป)`, async () => {
+        await undoSoftDelete('patients', patSnap);
+        for (const v of visitSnaps) await undoSoftDelete('visits', v);
+        for (const ph of photoSnaps) await undoSoftDelete('photos', ph);
+        showHome();
+      });
+      return;
+    } catch (err) {
+      dwarn('soft delete patient failed', err);
+      showToast('ลบไม่สำเร็จ — ข้อมูลไม่ถูกเปลี่ยนแปลง');
+      return;
+    }
+    /* legacy hard-delete below (disabled by early return above):
     try {
       // C5: single atomic transaction — all-or-nothing
       await new Promise((res, rej) => {
@@ -4038,19 +4253,37 @@ function confirmDeletePatient(id) {
       console.error('Delete failed:', err);
       showToast('ลบไม่สำเร็จ — ข้อมูลไม่ถูกเปลี่ยนแปลง');
     }
+  */
   });
 }
 
 function confirmDeleteVisit(id) {
-  showConfirm('ลบ Visit', 'Visit นี้และรูปภาพทั้งหมดจะถูกลบถาวร', async () => {
-    const photos = await dbGetByIndex('photos','visitId', id);
-    for (const ph of photos) await dbDelete('photos', ph.id);
-    await dbDelete('visits', id);
-    showToast('ลบ Visit แล้ว');
-    if (currentPatientId) {
-      showPatient(currentPatientId);
-    } else {
-      showHome();
+  showConfirm('ลบ Visit', 'Visit นี้จะถูกลบ (มี 30 วันให้กู้คืน)', async () => {
+    try {
+      // Soft delete: snapshot visit + photos, set deletedAt on each
+      const visitSnap = await softDelete('visits', id);
+      if (!visitSnap) return;
+      const photos = await dbGetByIndex('photos','visitId', id);
+      const photoSnaps = [];
+      for (const ph of photos) {
+        photoSnaps.push({ ...ph });
+        ph.deletedAt = visitSnap.deletedAt;
+        await dbPut('photos', ph);
+      }
+      if (currentPatientId) {
+        showPatient(currentPatientId);
+      } else {
+        showHome();
+      }
+      showUndoToast(`ลบ Visit แล้ว (${photoSnaps.length} รูป)`, async () => {
+        await undoSoftDelete('visits', visitSnap);
+        for (const phSnap of photoSnaps) await undoSoftDelete('photos', phSnap);
+        if (currentPatientId) showPatient(currentPatientId);
+        else showHome();
+      });
+    } catch (err) {
+      dwarn('Delete visit failed:', err);
+      showToast('ลบไม่สำเร็จ — ข้อมูลไม่ถูกเปลี่ยนแปลง');
     }
   });
 }
@@ -4064,6 +4297,56 @@ function showToast(msg, type='') {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => el.classList.remove('show'), 2800);
 }
+// Soft delete + Undo toast — shows message with Undo button for 5s
+let _undoTimer = null;
+function showUndoToast(msg, undoCallback) {
+  const el = document.getElementById('toast');
+  el.innerHTML = `<span style="margin-right:12px;">${msg}</span><button id="undoBtn" style="padding:4px 10px;background:#fff;color:var(--primary);border:none;border-radius:4px;cursor:pointer;font-weight:600;font-size:13px;">เลิกทำ</button>`;
+  el.className = 'toast show';
+  clearTimeout(_undoTimer);
+  clearTimeout(toastTimer);
+  const undoBtn = document.getElementById('undoBtn');
+  if (undoBtn) {
+    undoBtn.onclick = async () => {
+      clearTimeout(_undoTimer);
+      el.classList.remove('show');
+      try { await undoCallback(); showToast('✓ เลิกทำสำเร็จ', 'ok'); }
+      catch(e) { dwarn('undo failed', e); showToast('เลิกทำไม่สำเร็จ'); }
+    };
+  }
+  _undoTimer = setTimeout(() => el.classList.remove('show'), 6000);
+}
+// Mark record as deleted (soft) instead of removing — auto-purges after 30 days
+async function softDelete(storeName, id) {
+  const rec = await dbGet(storeName, id);
+  if (!rec) return null;
+  const snapshot = { ...rec }; // for undo
+  rec.deletedAt = new Date().toISOString();
+  await dbPut(storeName, rec);
+  return snapshot;
+}
+async function undoSoftDelete(storeName, snapshot) {
+  if (!snapshot) return;
+  delete snapshot.deletedAt;
+  await dbPut(storeName, snapshot);
+}
+// Purge soft-deleted records older than 30 days — call on app start
+async function purgeOldTrash() {
+  try {
+    const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    for (const store of ['patients','visits','photos']) {
+      const all = await dbGetAll(store);
+      for (const r of all) {
+        if (r.deletedAt && new Date(r.deletedAt).getTime() < cutoff) {
+          await dbDelete(store, r.id);
+        }
+      }
+    }
+  } catch (e) { dwarn('purgeOldTrash error', e); }
+}
+// Filter helper: exclude soft-deleted records
+function notDeleted(r) { return !r.deletedAt; }
+
 
 // ─── UTILS ───────────────────────────────────────────────────────────
 function esc(s) {
@@ -4150,9 +4433,9 @@ async function goDashboardProc(procName, ceYear, monthIdx) {
     if (d.getFullYear() !== ceYear) return false;
     if (monthIdx !== null && d.getMonth() !== monthIdx) return false;
     const inOp   = (v.procedures || []).length
-      ? v.procedures.some(p => (p.procedure || '').toLowerCase() === pq)
-      : (v.procedure || '').toLowerCase() === pq;
-    const inSkin = (v.skinProcedures || []).some(p => (p.skinProcedure || p.procedure || p.name || '').toLowerCase() === pq);
+      ? v.procedures.some(p => (p.procedure || '').trim().toLowerCase() === pq)
+      : (v.procedure || '').trim().toLowerCase() === pq;
+    const inSkin = (v.skinProcedures || []).some(p => (p.skinProcedure || p.procedure || p.name || '').trim().toLowerCase() === pq);
     return inOp || inSkin;
   });
   const patientIds = new Set(matchingVisits.map(v => v.patientId));
@@ -4394,13 +4677,13 @@ async function renderDashboard() {
         const addOnRaw2 = (p.addOn||v.addOn||'').trim();
         const addOns2 = addOnRaw2 ? addOnRaw2.split(',').map(s=>s.trim()).filter(Boolean) : [];
         const _RA = ['Alarplasty','Osteotomy','Ear fascia','Coccyx fascia','Fascia cartilage','ADM'];
-        const matched2 = addOns2.filter(a => _RA.some(ra => ra.toLowerCase()===a.toLowerCase()));
+        const matched2 = addOns2.filter(a => _RA.some(ra => ra.trim().toLowerCase()===a.trim().toLowerCase()));
         const addonTarget2 = isRhino2 ? ys.rhinoAddon : ys.revAddon;
         if (matched2.length === 0) {
           addonTarget2['(ว่าง)']++;
         } else {
           for (const a of matched2) {
-            const key2 = _RA.find(ra => ra.toLowerCase()===a.toLowerCase());
+            const key2 = _RA.find(ra => ra.trim().toLowerCase()===a.trim().toLowerCase());
             if (key2) addonTarget2[key2]++;
           }
         }
@@ -4803,7 +5086,7 @@ async function renderDashboard() {
 
 // ─── EXPORT / IMPORT ─────────────────────────────────────────────────
 async function exportData() {
-  const patients = await dbGetAll('patients');
+  const patients = (await dbGetAll('patients')).filter(notDeleted);
   const visits   = await dbGetAll('visits');
   const photos   = await dbGetAll('photos');
   const payload  = { version: 1, exportedAt: new Date().toISOString(), patients, visits, photos };
@@ -4890,15 +5173,45 @@ async function _doImport(patients, visits, photos, conflictMode, existingPtMap, 
         idMap.set(p.id, newId);
         await dbPut('patients', { ...p, id: newId });
       } else {
+        // overwrite: remove existing visits+photos of this patient first to avoid orphan data
+        if (isConflict) {
+          const oldVisits = await dbGetByIndex('visits','patientId', p.id);
+          for (const ov of oldVisits) {
+            const oldPhotos = await dbGetByIndex('photos','visitId', ov.id);
+            for (const oph of oldPhotos) await dbDelete('photos', oph.id);
+            await dbDelete('visits', ov.id);
+          }
+          // also remove patient-level photos (orphan, no visit)
+          const orphanPhotos = await dbGetByIndex('photos','patientId', p.id);
+          for (const oph of orphanPhotos) await dbDelete('photos', oph.id);
+        }
         await dbPut('patients', p);
       }
       pAdd++;
-    } catch(e) { pSkip++; console.warn('import patient fail', p.id, e); }
+    } catch(e) { pSkip++; dwarn('import patient fail', p.id, e); }
   }
+  // Build map of existing visits per patient+date to detect duplicate-date conflicts
+  const allExistingVisits = await dbGetAll('visits');
+  const dateKeySet = new Set(); // key = patientId|date (only non-deleted)
+  for (const ev of allExistingVisits) {
+    if (!ev.deletedAt) dateKeySet.add(`${ev.patientId}|${ev.date}`);
+  }
+  let vDateDup = 0;
   for (const v of visits) {
     const isConflict = existingVIds.has(v.id);
     if (isConflict && conflictMode === 'skip') { vSkip++; continue; }
     const remappedPid = idMap.get(v.patientId) || v.patientId;
+    // Duplicate-date check: skip if another visit already exists for this patient on this date
+    // (Skip this check when conflictMode === 'overwrite' for same id — id-match wins)
+    if (!isConflict || conflictMode === 'newid') {
+      const key = `${remappedPid}|${v.date}`;
+      if (dateKeySet.has(key)) {
+        vDateDup++; vSkip++;
+        dwarn('import visit duplicate-date', v.id, key);
+        continue;
+      }
+      dateKeySet.add(key);
+    }
     try {
       if (isConflict && conflictMode === 'newid') {
         await dbPut('visits', { ...v, id: uid(), patientId: remappedPid });
@@ -4906,15 +5219,15 @@ async function _doImport(patients, visits, photos, conflictMode, existingPtMap, 
         await dbPut('visits', { ...v, patientId: remappedPid });
       }
       vAdd++;
-    } catch(e) { vSkip++; console.warn('import visit fail', v.id, e); }
+    } catch(e) { vSkip++; dwarn('import visit fail', v.id, e); }
   }
   for (const ph of photos) {
-    if (!ph || !ph.id || !ph.dataUrl) continue;
+    if (!ph || !ph.id || !(ph.dataUrl || ph.blob)) continue;
     const remappedPid = idMap.get(ph.patientId) || ph.patientId;
     try { await dbPut('photos', { ...ph, patientId: remappedPid }); phAdd++; }
-    catch(e) { console.warn('import photo fail', ph.id, e); }
+    catch(e) { dwarn('import photo fail', ph.id, e); }
   }
-  const skipMsg = (pSkip+vSkip) ? ` (ข้าม ${pSkip+vSkip})` : '';
+  const skipMsg = (pSkip+vSkip) ? ` (ข้าม ${pSkip+vSkip}${vDateDup?`, ${vDateDup} visit ซ้ำวัน`:''})` : '';
   showToast(`Import สำเร็จ — เพิ่ม ${pAdd} patient, ${vAdd} visit, ${phAdd} รูป${skipMsg}`, 'ok');
   showHome();
 }
@@ -4973,6 +5286,19 @@ async function migrateDOBYears() {
 async function initApp() {
   await initDB();
   await migrateDOBYears();
+  purgeOldTrash(); // ล้าง trash เก่าเกิน 30 วัน (ไม่ต้อง await)
+  // Migrate legacy base64 photos → Blob (run in background, don't block UI)
+  if (localStorage.getItem('photoMigrationDone_v1') !== '1') {
+    migratePhotosToBlob();
+  } else {
+    // double-check: scan for leftover legacy in case prior migration was interrupted
+    (async () => {
+      try {
+        const all = await dbGetAll('photos');
+        if (all.some(p => p.dataUrl && !p.blob)) migratePhotosToBlob();
+      } catch (e) { dwarn('migration scan error', e); }
+    })();
+  }
   cleanExpiredCache(); // ลบ cache เกิน 4 เดือน (ไม่ต้อง await เพื่อไม่ให้ delay การเปิดหน้า)
   showHome();
   // Auto login ถ้าเปิดใช้งาน (หลัง Google API โหลดเสร็จ)
@@ -5056,10 +5382,10 @@ async function renderCharts() {
         if (isRv) ys.revTotal++;
         const aRaw = (p.addOn||v.addOn||'').trim();
         const aList = aRaw ? aRaw.split(',').map(s=>s.trim()).filter(Boolean) : [];
-        const aMatch = aList.filter(a => _RA2.some(r => r.toLowerCase()===a.toLowerCase()));
+        const aMatch = aList.filter(a => _RA2.some(r => r.toLowerCase()===a.trim().toLowerCase()));
         const aBkt = isRh ? ys.rhinoAddon : ys.revAddon;
         if (aMatch.length === 0) { aBkt['(ว่าง)']++; }
-        else { for (const a of aMatch) { const k=_RA2.find(r=>r.toLowerCase()===a.toLowerCase()); if(k) aBkt[k]++; } }
+        else { for (const a of aMatch) { const k=_RA2.find(r=>r.toLowerCase()===a.trim().toLowerCase()); if(k) aBkt[k]++; } }
       }
     }
   }
@@ -5110,13 +5436,13 @@ async function renderCharts() {
         if (isRev)   months[mi].revTotal++;
         const addOnRaw = (p.addOn||v.addOn||'').trim();
         const addOns = addOnRaw ? addOnRaw.split(',').map(s=>s.trim()).filter(Boolean) : [];
-        const matched = addOns.filter(a => RHINO_ADDONS.some(ra => ra.toLowerCase()===a.toLowerCase()));
+        const matched = addOns.filter(a => RHINO_ADDONS.some(ra => ra.trim().toLowerCase()===a.trim().toLowerCase()));
         const addonTarget = isRhino ? months[mi].rhinoAddon : months[mi].revAddon;
         if (matched.length === 0) {
           addonTarget['(ว่าง)']++;
         } else {
           for (const a of matched) {
-            const key = RHINO_ADDONS.find(ra => ra.toLowerCase()===a.toLowerCase()) || a;
+            const key = RHINO_ADDONS.find(ra => ra.trim().toLowerCase()===a.trim().toLowerCase()) || a;
             if (key in addonTarget) addonTarget[key]++;
           }
         }
@@ -5567,8 +5893,8 @@ function _renderProcedure(yearStats, ceYear) {
 
   // dataset 0: หัตถการอื่นๆ (ไม่ใช่ rhino/rev)
   const otherData = labels.map((l,i) => {
-    const isRh = l.toLowerCase()==='rhinoplasty';
-    const isRv = l.toLowerCase()==='rhinoplasty revision';
+    const isRh = l.trim().toLowerCase()==='rhinoplasty';
+    const isRv = l.trim().toLowerCase()==='rhinoplasty revision';
     return (isRh || isRv) ? 0 : allEntries[i][1];
   });
 
@@ -5583,8 +5909,8 @@ function _renderProcedure(yearStats, ceYear) {
   // addon datasets สำหรับ rhino และ rev
   ADDON_KEYS.forEach((key, ki) => {
     const data = labels.map((l) => {
-      const isRh = l.toLowerCase()==='rhinoplasty';
-      const isRv = l.toLowerCase()==='rhinoplasty revision';
+      const isRh = l.trim().toLowerCase()==='rhinoplasty';
+      const isRv = l.trim().toLowerCase()==='rhinoplasty revision';
       if (isRh) return (ys.rhinoAddon||{})[key] || 0;
       if (isRv) return (ys.revAddon||{})[key] || 0;
       return 0;
@@ -5700,13 +6026,13 @@ async function renderOutcomes() {
     }
   }
 
-  function hasComp(fuVisit, type) {
-    const sxComp   = (fuVisit.complicationSx   || fuVisit.complication || '').trim();
-    const skinComp = (fuVisit.complicationSkin || fuVisit.skinComplication || '').trim();
+  function _hasFuComp(fuVisit, type) {
+    const sxComp   = (fuVisit.complication   || fuVisit.complication || '').trim();
+    const skinComp = (fuVisit.skinComplication || fuVisit.skinComplication || '').trim();
     const NONE = /^(none|ไม่มี|-)$/i;
     const hasSx   = sxComp   && !NONE.test(sxComp);
     const hasSkin = skinComp && !NONE.test(skinComp);
-    const level  = fuVisit.complicationLevel || fuVisit.complicationSxLevel || '';
+    const level  = fuVisit.complicationLevel || fuVisit.complicationLevel || '';
     const skinLv = fuVisit.skinComplicationLevel || '';
     if (type === 'sx')    return hasSx;
     if (type === 'skin')  return hasSkin;
@@ -5839,8 +6165,8 @@ async function renderOutcomes() {
   // helper: นับ ongoing comp สำหรับ range (แยก type)
   function hasOngoingComp(v, type) {
     const NONE = /^(none|ไม่มี|-)$/i;
-    const sxComp   = (v.complicationSx || v.complication || '').trim();
-    const skinComp = (v.complicationSkin || v.skinComplication || '').trim();
+    const sxComp   = (v.complication || v.complication || '').trim();
+    const skinComp = (v.skinComplication || v.skinComplication || '').trim();
     const hasSx    = sxComp   && !NONE.test(sxComp)   && (v.complicationStatus || 'ongoing') === 'ongoing';
     const hasSkin  = skinComp && !NONE.test(skinComp)  && (v.skinComplicationStatus || 'ongoing') === 'ongoing';
     const level  = v.complicationLevel || '';
@@ -5945,7 +6271,7 @@ async function exportPatientPDF(patientId) {
 
   // นับรูปทั้งหมดก่อนเพื่อแสดง progress
   const allPhotos = await dbGetByIndex('photos', 'patientId', patientId);
-  const needFetch = allPhotos.filter(ph => !ph.dataUrl && ph.driveFileId).length;
+  const needFetch = allPhotos.filter(ph => !ph.dataUrl && !ph.blob && ph.driveFileId).length;
   let fetchedCount = 0;
   if (needFetch > 0) showToast(`⏳ กำลังโหลดรูป 0/${needFetch}...`, 'info');
 
@@ -5968,38 +6294,38 @@ async function exportPatientPDF(patientId) {
     const procs = Array.isArray(v.procedures) ? v.procedures : [];
     const procHTML = procs.length ? procs.map(pr => `
       <div style="background:#f8f9fa;border-radius:6px;padding:10px 14px;margin-bottom:8px;">
-        <div style="font-weight:700;font-size:13px;color:#1a5276;margin-bottom:6px;">🔪 ${pr.procedure||pr.name||''}</div>
+        <div style="font-weight:700;font-size:13px;color:#1a5276;margin-bottom:6px;">🔪 ${esc(pr.procedure||pr.name||'')}</div>
         <div style="display:flex;flex-wrap:wrap;gap:6px 20px;margin-bottom:4px;">
-          ${pr.technique  ? `<div style="font-size:12px;"><span style="color:#7f8c8d;">Technique:</span> ${pr.technique}</div>` : ''}
-          ${pr.anesthesia ? `<div style="font-size:12px;"><span style="color:#7f8c8d;">Anesthesia:</span> ${pr.anesthesia}</div>` : ''}
-          ${pr.implant    ? `<div style="font-size:12px;"><span style="color:#7f8c8d;">Implant:</span> ${pr.implant}</div>` : ''}
-          ${pr.graft      ? `<div style="font-size:12px;"><span style="color:#7f8c8d;">Graft:</span> ${pr.graft}</div>` : ''}
-          ${pr.addOn      ? `<div style="font-size:12px;"><span style="color:#7f8c8d;">Add-on:</span> ${pr.addOn}</div>` : ''}
+          ${pr.technique  ? `<div style="font-size:12px;"><span style="color:#7f8c8d;">Technique:</span> ${esc(pr.technique)}</div>` : ''}
+          ${pr.anesthesia ? `<div style="font-size:12px;"><span style="color:#7f8c8d;">Anesthesia:</span> ${esc(pr.anesthesia)}</div>` : ''}
+          ${pr.implant    ? `<div style="font-size:12px;"><span style="color:#7f8c8d;">Implant:</span> ${esc(pr.implant)}</div>` : ''}
+          ${pr.graft      ? `<div style="font-size:12px;"><span style="color:#7f8c8d;">Graft:</span> ${esc(pr.graft)}</div>` : ''}
+          ${pr.addOn      ? `<div style="font-size:12px;"><span style="color:#7f8c8d;">Add-on:</span> ${esc(pr.addOn)}</div>` : ''}
         </div>
-        ${pr.opNote||pr.note ? `<div style="font-size:12px;margin-top:6px;white-space:pre-wrap;border-top:1px solid #e5e8e8;padding-top:6px;">${pr.opNote||pr.note}</div>` : ''}
-        ${pr.intraComp && pr.intraComp.toLowerCase()!=='none' ? `<div style="font-size:12px;color:#c0392b;margin-top:4px;">⚡ Intraop: ${pr.intraComp}</div>` : ''}
+        ${pr.opNote||pr.note ? `<div style="font-size:12px;margin-top:6px;white-space:pre-wrap;border-top:1px solid #e5e8e8;padding-top:6px;">${esc(pr.opNote||pr.note)}</div>` : ''}
+        ${pr.intraComp && pr.intraComp.toLowerCase()!=='none' ? `<div style="font-size:12px;color:#c0392b;margin-top:4px;">⚡ Intraop: ${esc(pr.intraComp)}</div>` : ''}
       </div>`).join('') : '';
 
     const historyHTML = v.history ? `
       <div style="margin-bottom:10px;">
         <div style="font-size:11px;font-weight:700;color:#7f8c8d;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">ประวัติ (History)</div>
-        <div style="background:#f8f9fa;border-radius:6px;padding:12px;font-size:13px;line-height:1.7;white-space:pre-wrap;">${v.history}</div>
+        <div style="background:#f8f9fa;border-radius:6px;padding:12px;font-size:13px;line-height:1.7;white-space:pre-wrap;">${esc(v.history)}</div>
       </div>` : '';
 
     const peHTML = v.pe ? `
       <div style="margin-bottom:10px;">
         <div style="font-size:11px;font-weight:700;color:#7f8c8d;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">การตรวจร่างกาย (PE)</div>
-        <div style="background:#f8f9fa;border-radius:6px;padding:12px;font-size:13px;line-height:1.7;white-space:pre-wrap;">${v.pe}</div>
+        <div style="background:#f8f9fa;border-radius:6px;padding:12px;font-size:13px;line-height:1.7;white-space:pre-wrap;">${esc(v.pe)}</div>
       </div>` : '';
 
     const vsItems = [];
-    if (v.vsBPSys||v.vsBPDia) vsItems.push(`<div style="text-align:center;"><div style="font-size:10px;color:#7f8c8d;">BP</div><div style="font-weight:700;">${v.vsBPSys||'—'}/${v.vsBPDia||'—'} <span style="font-size:10px;font-weight:400;">mmHg</span></div></div>`);
-    if (v.vsHR)     vsItems.push(`<div style="text-align:center;"><div style="font-size:10px;color:#7f8c8d;">HR</div><div style="font-weight:700;">${v.vsHR} <span style="font-size:10px;font-weight:400;">bpm</span></div></div>`);
-    if (v.vsSpO2)   vsItems.push(`<div style="text-align:center;"><div style="font-size:10px;color:#7f8c8d;">SpO₂</div><div style="font-weight:700;">${v.vsSpO2} <span style="font-size:10px;font-weight:400;">%</span></div></div>`);
-    if (v.vsTemp)   vsItems.push(`<div style="text-align:center;"><div style="font-size:10px;color:#7f8c8d;">Temp</div><div style="font-weight:700;">${v.vsTemp} <span style="font-size:10px;font-weight:400;">°C</span></div></div>`);
-    if (v.vsRR)     vsItems.push(`<div style="text-align:center;"><div style="font-size:10px;color:#7f8c8d;">RR</div><div style="font-weight:700;">${v.vsRR} <span style="font-size:10px;font-weight:400;">/min</span></div></div>`);
-    if (v.vsWeight) vsItems.push(`<div style="text-align:center;"><div style="font-size:10px;color:#7f8c8d;">Weight</div><div style="font-weight:700;">${v.vsWeight} <span style="font-size:10px;font-weight:400;">kg</span></div></div>`);
-    if (v.vsHeight) vsItems.push(`<div style="text-align:center;"><div style="font-size:10px;color:#7f8c8d;">Height</div><div style="font-weight:700;">${v.vsHeight} <span style="font-size:10px;font-weight:400;">cm</span></div></div>`);
+    if (v.vsBPSys||v.vsBPDia) vsItems.push(`<div style="text-align:center;"><div style="font-size:10px;color:#7f8c8d;">BP</div><div style="font-weight:700;">${esc(v.vsBPSys||'—')}/${esc(v.vsBPDia||'—')} <span style="font-size:10px;font-weight:400;">mmHg</span></div></div>`);
+    if (v.vsHR)     vsItems.push(`<div style="text-align:center;"><div style="font-size:10px;color:#7f8c8d;">HR</div><div style="font-weight:700;">${esc(v.vsHR)} <span style="font-size:10px;font-weight:400;">bpm</span></div></div>`);
+    if (v.vsSpO2)   vsItems.push(`<div style="text-align:center;"><div style="font-size:10px;color:#7f8c8d;">SpO₂</div><div style="font-weight:700;">${esc(v.vsSpO2)} <span style="font-size:10px;font-weight:400;">%</span></div></div>`);
+    if (v.vsTemp)   vsItems.push(`<div style="text-align:center;"><div style="font-size:10px;color:#7f8c8d;">Temp</div><div style="font-weight:700;">${esc(v.vsTemp)} <span style="font-size:10px;font-weight:400;">°C</span></div></div>`);
+    if (v.vsRR)     vsItems.push(`<div style="text-align:center;"><div style="font-size:10px;color:#7f8c8d;">RR</div><div style="font-weight:700;">${esc(v.vsRR)} <span style="font-size:10px;font-weight:400;">/min</span></div></div>`);
+    if (v.vsWeight) vsItems.push(`<div style="text-align:center;"><div style="font-size:10px;color:#7f8c8d;">Weight</div><div style="font-weight:700;">${esc(v.vsWeight)} <span style="font-size:10px;font-weight:400;">kg</span></div></div>`);
+    if (v.vsHeight) vsItems.push(`<div style="text-align:center;"><div style="font-size:10px;color:#7f8c8d;">Height</div><div style="font-weight:700;">${esc(v.vsHeight)} <span style="font-size:10px;font-weight:400;">cm</span></div></div>`);
     const vitalHTML = vsItems.length ? `
       <div style="margin-bottom:10px;">
         <div style="font-size:11px;font-weight:700;color:#7f8c8d;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">🩺 Vital Signs</div>
@@ -6009,23 +6335,23 @@ async function exportPatientPDF(patientId) {
     const opNote = v.opNote ? `
       <div style="margin-top:10px;">
         <div style="font-size:11px;font-weight:700;color:#7f8c8d;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">Op Note</div>
-        <div style="background:#f8f9fa;border-radius:6px;padding:12px;font-size:13px;line-height:1.7;white-space:pre-wrap;">${v.opNote}</div>
+        <div style="background:#f8f9fa;border-radius:6px;padding:12px;font-size:13px;line-height:1.7;white-space:pre-wrap;">${esc(v.opNote)}</div>
       </div>` : '';
 
     const complications = [];
-    if (v.complicationSx && v.complicationSx !== 'none') complications.push(`Surgery: ${v.complicationSx}${v.complicationSxDetail ? ' — '+v.complicationSxDetail : ''}`);
-    if (v.complicationSkin && v.complicationSkin !== 'none') complications.push(`Skin: ${v.complicationSkin}${v.complicationSkinDetail ? ' — '+v.complicationSkinDetail : ''}`);
-    if (v.drConcern) complications.push(`Dr Concern: ${v.drConcernDetail||''}`);
-    if (v.ptConcern) complications.push(`Pt Concern: ${v.ptConcernDetail||''}`);
+    if (v.complication && v.complication !== 'none') complications.push(`Surgery: ${esc(v.complication)}${'' ? ' — '+'' : ''}`);
+    if (v.skinComplication && v.skinComplication !== 'none') complications.push(`Skin: ${esc(v.skinComplication)}${'' ? ' — '+'' : ''}`);
+    if (v.doctorConcern) complications.push(`Dr Concern: ${esc(v.doctorConcern||'')}`);
+    if (v.patientConcern) complications.push(`Pt Concern: ${esc(v.patientConcern||'')}`);
     const compHTML = complications.length ? `
       <div style="margin-top:10px;background:#fdf2f2;border-left:3px solid #e74c3c;border-radius:4px;padding:10px 14px;">
         <div style="font-size:11px;font-weight:700;color:#c0392b;margin-bottom:6px;">⚠️ Complications / Concerns</div>
-        ${complications.map(c=>`<div style="font-size:12px;margin-bottom:3px;">• ${c}</div>`).join('')}
+        ${complications.map(c=>`<div style="font-size:12px;margin-bottom:3px;">• ${esc(c)}</div>`).join('')}
       </div>` : '';
 
     const photoToImg = async (ph) => {
       const src = await getPhotoSrc(ph);
-      if (!ph.dataUrl && ph.driveFileId && needFetch > 0 && src !== PHOTO_PLACEHOLDER) {
+      if (!ph.dataUrl && !ph.blob && ph.driveFileId && needFetch > 0 && src !== PHOTO_PLACEHOLDER) {
         fetchedCount++;
         showToast(`⏳ กำลังโหลดรูป ${fetchedCount}/${needFetch}...`, 'info');
       }
@@ -6074,19 +6400,19 @@ async function exportPatientPDF(patientId) {
 
   // Complication summary
   const allComps = visits.filter(v =>
-    (v.complicationSx && v.complicationSx !== 'none') ||
-    (v.complicationSkin && v.complicationSkin !== 'none') ||
-    v.drConcern || v.ptConcern
+    (v.complication && v.complication !== 'none') ||
+    (v.skinComplication && v.skinComplication !== 'none') ||
+    v.doctorConcern || v.patientConcern
   );
   const compSummaryHTML = allComps.length ? `
     <div style="page-break-before:auto;margin-bottom:20px;">
       <div style="font-size:15px;font-weight:700;color:#c0392b;margin-bottom:12px;padding-bottom:6px;border-bottom:2px solid #fadbd8;">⚠️ Complication Summary</div>
       ${allComps.map(v => {
         const items = [];
-        if (v.complicationSx && v.complicationSx !== 'none') items.push(`Surgery (${v.complicationSx})${v.complicationSxDetail ? ': '+v.complicationSxDetail : ''}`);
-        if (v.complicationSkin && v.complicationSkin !== 'none') items.push(`Skin (${v.complicationSkin})${v.complicationSkinDetail ? ': '+v.complicationSkinDetail : ''}`);
-        if (v.drConcern) items.push(`Dr Concern: ${v.drConcernDetail||'-'}`);
-        if (v.ptConcern) items.push(`Pt Concern: ${v.ptConcernDetail||'-'}`);
+        if (v.complication && v.complication !== 'none') items.push(`Surgery (${esc(v.complication)})${'' ? ': '+'' : ''}`);
+        if (v.skinComplication && v.skinComplication !== 'none') items.push(`Skin (${esc(v.skinComplication)})${'' ? ': '+'' : ''}`);
+        if (v.doctorConcern) items.push(`Dr Concern: ${v.doctorConcern||'-'}`);
+        if (v.patientConcern) items.push(`Pt Concern: ${v.patientConcern||'-'}`);
         return `<div style="margin-bottom:10px;background:#fff8f8;border-radius:6px;padding:10px 14px;border-left:3px solid #e74c3c;">
           <div style="font-size:12px;font-weight:700;color:#7f8c8d;margin-bottom:4px;">${fmtDate(v.date)} — ${v.type||'Visit'}</div>
           ${items.map(i=>`<div style="font-size:13px;margin-bottom:2px;">• ${i}</div>`).join('')}
@@ -6099,7 +6425,7 @@ async function exportPatientPDF(patientId) {
 <html lang="th">
 <head>
 <meta charset="UTF-8">
-<title>OPD Summary — ${p.name}</title>
+<title>OPD Summary — ${esc(p.name)}</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: 'Segoe UI', Tahoma, sans-serif; color: #2c3e50; font-size: 14px; background: #fff; padding: 32px; }
@@ -6114,19 +6440,19 @@ async function exportPatientPDF(patientId) {
   <div style="border-bottom:3px solid #1a5276;padding-bottom:16px;margin-bottom:24px;">
     <div style="display:flex;justify-content:space-between;align-items:flex-start;">
       <div>
-        <div style="font-size:24px;font-weight:700;color:#1a5276;">${p.name}</div>
+        <div style="font-size:24px;font-weight:700;color:#1a5276;">${esc(p.name)}</div>
         <div style="font-size:13px;color:#7f8c8d;margin-top:4px;display:flex;gap:20px;flex-wrap:wrap;">
           ${p.dob ? `<span>🎂 ${fmtDate(p.dob)} (${age})</span>` : ''}
-          ${p.gender ? `<span>⚧ ${p.gender}</span>` : ''}
-          ${p.hn ? `<span>🏥 HN: ${p.hn}</span>` : ''}
-          ${p.phone ? `<span>📞 ${p.phone}</span>` : ''}
+          ${p.gender ? `<span>⚧ ${esc(p.gender)}</span>` : ''}
+          ${p.hn ? `<span>🏥 HN: ${esc(p.hn)}</span>` : ''}
+          ${p.phone ? `<span>📞 ${esc(p.phone)}</span>` : ''}
         </div>
-        ${p.drugAllergy ? `<div style="font-size:12px;color:#e74c3c;margin-top:6px;background:#fdf2f2;padding:4px 8px;border-radius:4px;display:inline-block;">⚠️ Drug Allergy: <b>${p.drugAllergy}</b></div>` : ''}
-        ${p.allergy ? `<div style="font-size:12px;color:#e74c3c;margin-top:4px;">⚠️ Allergy: ${p.allergy}</div>` : ''}
-        ${p.medHistory ? `<div style="font-size:12px;color:#1a6b8a;margin-top:4px;">🏥 โรคประจำตัว: ${p.medHistory}</div>` : ''}
-        ${p.congenitalDisease ? `<div style="font-size:12px;color:#e67e22;margin-top:4px;">🩺 Underlying: ${p.congenitalDisease}</div>` : ''}
-        ${p.surgicalHistory ? `<div style="font-size:12px;color:#6c3483;margin-top:4px;">🔪 ประวัติศัลยกรรม: ${p.surgicalHistory}</div>` : ''}
-        ${p.chiefComplaint ? `<div style="font-size:12px;color:#2c3e50;margin-top:4px;">💬 CC: ${p.chiefComplaint}</div>` : ''}
+        ${p.drugAllergy ? `<div style="font-size:12px;color:#e74c3c;margin-top:6px;background:#fdf2f2;padding:4px 8px;border-radius:4px;display:inline-block;">⚠️ Drug Allergy: <b>${esc(p.drugAllergy)}</b></div>` : ''}
+        ${p.allergy ? `<div style="font-size:12px;color:#e74c3c;margin-top:4px;">⚠️ Allergy: ${esc(p.allergy)}</div>` : ''}
+        ${p.medHistory ? `<div style="font-size:12px;color:#1a6b8a;margin-top:4px;">🏥 โรคประจำตัว: ${esc(p.medHistory)}</div>` : ''}
+        ${p.congenitalDisease ? `<div style="font-size:12px;color:#e67e22;margin-top:4px;">🩺 Underlying: ${esc(p.congenitalDisease)}</div>` : ''}
+        ${p.surgicalHistory ? `<div style="font-size:12px;color:#6c3483;margin-top:4px;">🔪 ประวัติศัลยกรรม: ${esc(p.surgicalHistory)}</div>` : ''}
+        ${p.chiefComplaint ? `<div style="font-size:12px;color:#2c3e50;margin-top:4px;">💬 CC: ${esc(p.chiefComplaint)}</div>` : ''}
       </div>
       <div style="text-align:right;font-size:11px;color:#aab7b8;">
         <div>พิมพ์: ${new Date().toLocaleDateString('th-TH',{year:'numeric',month:'long',day:'numeric'})}</div>
@@ -6166,6 +6492,7 @@ async function exportPatientPDF(patientId) {
 
   if (needFetch > 0) showToast(`✅ โหลดรูปครบ ${needFetch} รูป กำลังเปิด PDF...`, 'ok');
   const win = window.open('', '_blank');
+  if (!win) { showToast('⚠️ กรุณาอนุญาต popup เพื่อ export PDF', 'error'); return; }
   win.document.write(html);
   win.document.close();
   win.onload = () => { win.focus(); win.print(); };
@@ -6226,7 +6553,7 @@ async function performDriveUpload() {
   btn.textContent = '☁️ กำลัง Upload...';
   try {
     // 1. เตรียมข้อมูล
-    const patients = await dbGetAll('patients');
+    const patients = (await dbGetAll('patients')).filter(notDeleted);
     const visits   = await dbGetAll('visits');
     const photos   = await dbGetAll('photos');
     const payload  = { version: 1, exportedAt: new Date().toISOString(), patients, visits, photos };
@@ -6340,6 +6667,7 @@ function updateAutoSyncBtn() {
 
 async function autoSync() {
   if (!autoSyncEnabled) return;
+  if (isSyncing) return;
   if (!sheetsTokenClient) initSheetsClient();
   if (!sheetsAccessToken) {
     sheetsTokenCallback = performSheetsSync;
@@ -6373,6 +6701,27 @@ function updateAutoLoginBtn() {
   }
 }
 
+async function _backgroundCachePhotos() {
+  try {
+    const photos = await dbGetAll('photos');
+    const needCache = photos.filter(ph => ph.driveFileId && !ph.dataUrl && !ph.blob);
+    if (!needCache.length) return;
+    dlog(`background cache: ${needCache.length} รูป`);
+    for (const ph of needCache) {
+      if (!sheetsAccessToken) break;
+      try {
+        const resp = await fetch(`https://www.googleapis.com/drive/v3/files/${ph.driveFileId}?alt=media`,
+          { headers: { Authorization: `Bearer ${sheetsAccessToken}` } });
+        if (resp.ok) {
+          const blob = await resp.blob();
+          await dbPut('photos', { ...ph, blob, dataUrl: null, cachedAt: new Date().toISOString() });
+        }
+      } catch(e) { dwarn('background cache failed for', ph.id, e); }
+    }
+    dlog('background cache เสร็จ');
+  } catch(e) { dwarn('_backgroundCachePhotos error', e); }
+}
+
 function autoLoginIfEnabled() {
   if (!autoLoginEnabled) return;
   if (sheetsAccessToken) return; // มี token อยู่แล้ว
@@ -6395,7 +6744,6 @@ function initSheetsClient() {
     scope: 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file',
     callback: async (resp) => {
       if (resp.error) { showToast('Sheets login ไม่สำเร็จ: ' + resp.error); return; }
-      sheetsAccessToken = resp.access_token;
       if (sheetsTokenCallback) { await sheetsTokenCallback(); sheetsTokenCallback = null; }
     }
   });
@@ -6461,7 +6809,7 @@ async function syncPhotos() {
       req.onerror = () => resolve([]);
     });
 
-    const toUpload = photos.filter(p => p.id && p.dataUrl && !existingFiles.has(`${p.id}__${p.visitId||''}__${p.patientId||''}__${p.photoType||''}__${p.sortOrder||0}.jpg`));
+    const toUpload = photos.filter(p => p.id && (p.dataUrl || p.blob) && !existingFiles.has(`${p.id}__${p.visitId||''}__${p.patientId||''}__${p.photoType||''}__${p.sortOrder||0}.jpg`));
     const total = toUpload.length;
     let uploaded = 0;
 
@@ -6469,69 +6817,35 @@ async function syncPhotos() {
       uploaded++;
       showProgress(`📸 Sync รูป ${uploaded}/${total}...`);
       const fileName = `${photo.id}__${photo.visitId||''}__${photo.patientId||''}__${photo.photoType||''}__${photo.sortOrder||0}.jpg`;
-      const base64 = photo.dataUrl.replace(/^data:image\/\w+;base64,/, '');
-      const byteChars = atob(base64);
-      const byteArr = new Uint8Array(byteChars.length);
-      for (let i = 0; i < byteChars.length; i++) byteArr[i] = byteChars.charCodeAt(i);
-      const blob = new Blob([byteArr], { type: 'image/jpeg' });
+      // Support both new Blob format and legacy dataUrl format
+      let blob;
+      if (photo.blob) {
+        blob = photo.blob;
+      } else if (photo.dataUrl) {
+        const base64 = photo.dataUrl.replace(/^data:image\/\w+;base64,/, '');
+        const byteChars = atob(base64);
+        const byteArr = new Uint8Array(byteChars.length);
+        for (let i = 0; i < byteChars.length; i++) byteArr[i] = byteChars.charCodeAt(i);
+        blob = new Blob([byteArr], { type: 'image/jpeg' });
+      } else {
+        continue; // skip photos with no image data
+      }
       const metadata = JSON.stringify({ name: fileName, parents: [folderId] });
       const form = new FormData();
       form.append('metadata', new Blob([metadata], { type: 'application/json' }));
       form.append('file', blob);
-      const uploadResp = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+      await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
         method: 'POST',
         headers: { Authorization: `Bearer ${sheetsAccessToken}` },
         body: form
       });
-      // หลัง upload สำเร็จ → บันทึก driveFileId และลบ dataUrl ออกจาก local (hybrid)
-      if (uploadResp.ok) {
-        const uploadData = await uploadResp.json();
-        await dbPut('photos', {
-          ...photo,
-          driveFileId: uploadData.id,
-          driveFileName: fileName,
-          cachedAt: new Date().toISOString(),
-          dataUrl: null  // ลบรูปจริงออก เหลือแค่ที่อยู่บน Drive
-        });
-      }
     }
     hideProgress();
     showToast(`📸 Sync รูปสำเร็จ: ${uploaded} รูปใหม่`, 'ok');
-    // Background cache: fetch รูปที่ยังไม่มี dataUrl กลับมาเก็บไว้ offline
-    _backgroundCachePhotos();
   } catch (e) {
     hideProgress();
     showToast('❌ Sync รูปล้มเหลว: ' + e.message);
   }
-}
-
-// Background cache รูปทั้งหมดจาก Drive → IndexedDB (ไม่ block UI)
-async function _backgroundCachePhotos() {
-  try {
-    const photos = await dbGetAll('photos');
-    const needCache = photos.filter(ph => ph.driveFileId && !ph.dataUrl);
-    if (!needCache.length) return;
-    console.log(`background cache: ${needCache.length} รูป`);
-    for (const ph of needCache) {
-      if (!sheetsAccessToken) break; // หยุดถ้า token หมด
-      try {
-        const resp = await fetch(
-          `https://www.googleapis.com/drive/v3/files/${ph.driveFileId}?alt=media`,
-          { headers: { Authorization: `Bearer ${sheetsAccessToken}` } }
-        );
-        if (resp.ok) {
-          const blob = await resp.blob();
-          const dataUrl = await new Promise(resolve => {
-            const reader = new FileReader();
-            reader.onload = () => resolve(reader.result);
-            reader.readAsDataURL(blob);
-          });
-          await dbPut('photos', { ...ph, dataUrl, cachedAt: new Date().toISOString() });
-        }
-      } catch(e) { console.warn('background cache failed for', ph.id, e); }
-    }
-    console.log('background cache เสร็จ');
-  } catch(e) { console.warn('_backgroundCachePhotos error', e); }
 }
 
 async function pullPhotos() {
@@ -6604,7 +6918,7 @@ async function syncToSheets() {
       sheetsTokenClient.requestAccessToken({ prompt: '' });
     }
   } catch(e) {
-    console.warn('Sheets sync error', e);
+    dwarn('Sheets sync error', e);
     isSyncing = false;
   }
 }
@@ -6612,8 +6926,8 @@ async function syncToSheets() {
 async function performSheetsSync() {
   try {
     showToast('⏳ กำลัง sync ข้อมูล...', 'info');
-    const patients = await dbGetAll('patients');
-    const visits = await dbGetAll('visits');
+    const patients = (await dbGetAll('patients')).filter(notDeleted);
+    const visits = (await dbGetAll('visits')).filter(notDeleted);
     const patientRows = [['id','hn','name','dob','gender','phone','allergy','createdAt','_json']];
     patients.forEach(p => {
       const jsonStr = JSON.stringify(p).replace(/\n/g,'\\n').replace(/\r/g,'\\r');
@@ -6704,6 +7018,47 @@ async function performPull() {
     showToast('❌ ดึงข้อมูลล้มเหลว: ' + e.message);
   }
 }
+
+
+// Keyboard shortcuts: Ctrl/Cmd+S = save current modal (visit/patient), Esc = close topmost modal
+document.addEventListener('keydown', (e) => {
+  // Skip if focus is on something that needs Ctrl+S (none here, but be safe in editable)
+  if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S')) {
+    const visitOpen = document.getElementById('overlayVisit')?.classList.contains('show');
+    const patientOpen = document.getElementById('overlayPatient')?.classList.contains('show');
+    if (visitOpen) { e.preventDefault(); if (typeof saveVisit === 'function') saveVisit(); return; }
+    if (patientOpen) { e.preventDefault(); if (typeof savePatient === 'function') savePatient(); return; }
+  }
+  if (e.key === 'Escape') {
+    // close topmost open modal (priority: confirm > xvCompare > visit > patient > lightbox)
+    const confirmO = document.getElementById('confirmOverlay');
+    if (confirmO && confirmO.classList.contains('show')) {
+      const cancel = confirmO.querySelector('[onclick*="closeConfirm"], .btn-outline');
+      if (cancel) { cancel.click(); return; }
+    }
+    const xv = document.getElementById('xvCompareModal');
+    if (xv && document.body.contains(xv)) {
+      if (typeof closeCrossVisitCompare === 'function') closeCrossVisitCompare();
+      return;
+    }
+    const lightbox = document.getElementById('lightbox');
+    if (lightbox && lightbox.classList.contains('show')) {
+      if (typeof closeLightbox === 'function') closeLightbox();
+      return;
+    }
+    const visitO = document.getElementById('overlayVisit');
+    if (visitO && visitO.classList.contains('show')) {
+      if (typeof closeVisitModal === 'function') closeVisitModal();
+      return;
+    }
+    const patientO = document.getElementById('overlayPatient');
+    if (patientO && patientO.classList.contains('show')) {
+      if (typeof closePatientModal === 'function') closePatientModal();
+      return;
+    }
+  }
+});
 </script>
 </body>
+
 </html>
